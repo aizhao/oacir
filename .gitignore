@@ -12,3 +12,8 @@ env/
 
 .vscode/
 .idea/
+
+# 模型 checkpoint、数据集、缓存
+checkpoints/
+Datasets/
+cache/

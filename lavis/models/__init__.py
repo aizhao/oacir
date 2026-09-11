@@ -43,7 +43,7 @@ from lavis.models.blip2_models.blip2_image_text_matching import Blip2ITM
 from lavis.models.blip2_models.blip2_qformer_oacir_baseline import Blip2QformerOacirBaseline
 from lavis.models.blip2_models.blip2_qformer_oacir_adafocal import Blip2QformerOacirAdaFocal
 from lavis.models.blip2_models.blip2_qformer_oacir_adafocal_vector import Blip2QformerOacirAdaFocalVector
-
+from lavis.models.blip2_models.blip2_qformer_oacir_latent import Blip2QformerOacirLatent
 from lavis.models.blip2_models.blip2_t5_instruct import Blip2T5Instruct
 from lavis.models.blip2_models.blip2_vicuna_instruct import Blip2VicunaInstruct
 
@@ -93,7 +93,7 @@ __all__ = [
     "Blip2QformerOacirBaseline",
     "Blip2QformerOacirAdaFocal",
     "Blip2QformerOacirAdaFocalVector",
-
+    "Blip2QformerOacirLatent",
     "Blip2T5Instruct",
     "Blip2VicunaInstruct",
 

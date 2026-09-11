@@ -184,19 +184,50 @@ class Blip2QformerOacirAdaFocal(Blip2Base):
 
 
     def forward(self, samples):
-        reference_image = samples["reference_image"]
         modification_text = samples["modification_text"]
-        target_image = samples["target_image"]
         reference_bbox = samples.get("reference_bbox", None)
+
+        # ------------------------------------------------------------
+        # Support two input modes:
+        # 1) original image mode:
+        #       samples["reference_image"], samples["target_image"]
+        # 2) cached feature mode:
+        #       samples["reference_image_embeds_raw"], samples["target_image_embeds_raw"]
+        #    where cached embeddings are raw visual_encoder outputs before ln_vision.
+        # ------------------------------------------------------------
+        if "reference_image_embeds_raw" in samples:
+            reference_image_embeds_raw = samples["reference_image_embeds_raw"]
+            target_image_embeds_raw = samples["target_image_embeds_raw"]
+
+            device = next(self.parameters()).device
+            reference_image_embeds_raw = reference_image_embeds_raw.to(device, non_blocking=True)
+            target_image_embeds_raw = target_image_embeds_raw.to(device, non_blocking=True)
+
+            reference_image_embeds = self.ln_vision(reference_image_embeds_raw)
+            target_image_embeds = self.ln_vision(target_image_embeds_raw)
+
+            batch_size = reference_image_embeds.size(0)
+            image_device = reference_image_embeds.device
+
+        else:
+            reference_image = samples["reference_image"]
+            target_image = samples["target_image"]
+
+            reference_image_embeds = self.ln_vision(self.visual_encoder(reference_image))
+            target_image_embeds = self.ln_vision(self.visual_encoder(target_image))
+
+            batch_size = reference_image.size(0)
+            image_device = reference_image.device
 
         is_highlighting = reference_bbox is not None and any(b is not None for b in reference_bbox)
 
-        reference_image_embeds = self.ln_vision(self.visual_encoder(reference_image))
-        reference_image_atts = torch.ones(reference_image_embeds.size()[:-1], dtype=torch.long).to(reference_image.device)
+        reference_image_atts = torch.ones(
+            reference_image_embeds.size()[:-1],
+            dtype=torch.long
+        ).to(image_device)
 
         query_tokens = self.query_tokens.expand(reference_image_embeds.shape[0], -1, -1)
-        # query_tokens = self.learnable_query_tokens.expand(reference_image_embeds.shape[0], -1, -1)
-        query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(reference_image.device)
+        query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image_device)
 
         modification_text_tokens = self.tokenizer(
             modification_text,
@@ -204,7 +235,7 @@ class Blip2QformerOacirAdaFocal(Blip2Base):
             truncation=True,
             max_length=self.max_txt_len,
             return_tensors="pt",
-        ).to(reference_image.device)
+        ).to(image_device)
 
         attention_bias = None
         fusion_atts = torch.cat([query_atts, modification_text_tokens.attention_mask], dim=1)
@@ -212,10 +243,10 @@ class Blip2QformerOacirAdaFocal(Blip2Base):
         ### =============== Contextual Perception (CAAM) =============== ###
         if is_highlighting:
             probe_tokens = self.contextual_probe_tokens.expand(reference_image_embeds.shape[0], -1, -1)
-            probe_atts = torch.ones(probe_tokens.size()[:-1], dtype=torch.long).to(reference_image.device)
+            probe_atts = torch.ones(probe_tokens.size()[:-1], dtype=torch.long).to(image_device)
+
             pre_fusion_atts = torch.cat([probe_atts, modification_text_tokens.attention_mask], dim=1)
 
-            # Interact Probe Tokens with Multimodal Inputs
             pre_fusion_output = self.Qformer.bert(
                 modification_text_tokens.input_ids,
                 query_embeds=probe_tokens,
@@ -225,14 +256,14 @@ class Blip2QformerOacirAdaFocal(Blip2Base):
                 return_dict=True,
             )
 
-            # Extract output features corresponding to probe tokens
             pre_fusion_features = pre_fusion_output.last_hidden_state[:, :self.num_probe_token, :]
-
-            # Predict Modulation Scalar via CRM
             adaptive_bias_scalar = self.crm_module(pre_fusion_features)
 
-            # Generate Modulated Attention Bias
-            batch_patch_mask = bbox_to_patch_mask(reference_bbox, patch_size=self.patch_size, device=reference_image.device)
+            batch_patch_mask = bbox_to_patch_mask(
+                reference_bbox,
+                patch_size=self.patch_size,
+                device=image_device,
+            )
             attention_bias = (adaptive_bias_scalar * batch_patch_mask).unsqueeze(1).unsqueeze(1)
 
         ### =============== Query Branch =============== ###
@@ -246,12 +277,16 @@ class Blip2QformerOacirAdaFocal(Blip2Base):
             attention_bias=attention_bias,
         )
 
-        # Extract [CLS] token and map to shared space via Linear_M
-        fusion_features = F.normalize(self.text_proj(fusion_output.last_hidden_state[:, self.num_query_token, :]), dim=-1)
+        fusion_features = F.normalize(
+            self.text_proj(fusion_output.last_hidden_state[:, self.num_query_token, :]),
+            dim=-1,
+        )
 
         ### =============== Target Branch =============== ###
-        target_image_embeds = self.ln_vision(self.visual_encoder(target_image))
-        target_image_atts = torch.ones(target_image_embeds.size()[:-1], dtype=torch.long).to(reference_image.device)
+        target_image_atts = torch.ones(
+            target_image_embeds.size()[:-1],
+            dtype=torch.long
+        ).to(image_device)
 
         target_output = self.Qformer.bert(
             query_embeds=query_tokens,
@@ -261,21 +296,30 @@ class Blip2QformerOacirAdaFocal(Blip2Base):
             return_dict=True,
         )
 
-        target_features = F.normalize(self.vision_proj(target_output.last_hidden_state), dim=-1)
+        target_features = F.normalize(
+            self.vision_proj(target_output.last_hidden_state),
+            dim=-1,
+        )
 
         ### =============== Contrastive Alignment Loss =============== ###
         sim_f2t = torch.matmul(
-            fusion_features.unsqueeze(1).unsqueeze(1), target_features.permute(0, 2, 1)
+            fusion_features.unsqueeze(1).unsqueeze(1),
+            target_features.permute(0, 2, 1),
         ).squeeze()
 
         sim_f2t, _ = sim_f2t.max(-1)
         sim_f2t = sim_f2t / self.temp
 
-        bs = reference_image.size(0)
-        targets = torch.linspace(0, bs - 1, bs, dtype=torch.long).to(reference_image.device)
+        targets = torch.linspace(
+            0,
+            batch_size - 1,
+            batch_size,
+            dtype=torch.long,
+        ).to(image_device)
+
         loss_align = F.cross_entropy(sim_f2t, targets)
 
-        return {'loss_align': loss_align}
+        return {"loss_align": loss_align}
 
 
     @torch.no_grad()

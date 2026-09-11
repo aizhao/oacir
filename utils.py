@@ -28,7 +28,53 @@ def collate_fn(batch: list):
     batch = list(filter(lambda x: x is not None, batch))
     return torch.utils.data.dataloader.default_collate(batch)
 
+@torch.no_grad()
+def extract_index_blip_features_with_raw(classic_val_dataset, blip_model, save_memory=False, batch_size=32, num_workers=4):
+    """
+    Extract:
+        index_features: target retrieval features after Q-Former/projection
+        index_raw_embeds: raw visual_encoder outputs before ln_vision
+        index_names
+    """
+    classic_val_loader = DataLoader(
+        dataset=classic_val_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=False,
+        collate_fn=collate_fn,
+        shuffle=False
+    )
 
+    index_features = []
+    index_raw_embeds = []
+    index_names = []
+
+    device_ = next(blip_model.parameters()).device
+
+    for names, images in tqdm(classic_val_loader, ncols=140, ascii=True):
+        images = images.to(device_, non_blocking=True)
+
+        with torch.cuda.amp.autocast():
+            if hasattr(blip_model, "extract_target_features_with_raw"):
+                image_features, raw_embeds = blip_model.extract_target_features_with_raw(images)
+            else:
+                raw_embeds = blip_model.visual_encoder(images)
+                image_embeds = blip_model.ln_vision(raw_embeds)
+                image_features, _ = blip_model.extract_target_features(images)
+
+        if save_memory:
+            index_features.append(image_features.detach().cpu())
+            index_raw_embeds.append(raw_embeds.detach().cpu().to(torch.float16))
+        else:
+            index_features.append(image_features.detach())
+            index_raw_embeds.append(raw_embeds.detach().to(torch.float16))
+
+        index_names.extend(names)
+
+    index_features = torch.cat(index_features, dim=0)
+    index_raw_embeds = torch.cat(index_raw_embeds, dim=0)
+
+    return index_features, index_raw_embeds, index_names
 def custom_collate_fn(batch: list):
 
     transposed_batch = list(zip(*batch))
@@ -59,6 +105,29 @@ def custom_collate_fn(batch: list):
             list(mod_texts),
             list(group_names_list),
             list(ref_bboxes)
+        )
+
+    elif len(transposed_batch) == 8:
+        ref_images_tuple = transposed_batch[0]
+        tgt_images_tuple = transposed_batch[1]
+        ref_images_batch = torch.stack(ref_images_tuple, dim=0)
+        tgt_images_batch = torch.stack(tgt_images_tuple, dim=0)
+        ref_names = transposed_batch[2]
+        tgt_names = transposed_batch[3]
+        mod_texts = transposed_batch[4]
+        ref_bboxes = transposed_batch[5]
+        target_instance_ids = transposed_batch[6]
+        object_categories = transposed_batch[7]
+
+        return (
+            ref_images_batch,
+            tgt_images_batch,
+            list(ref_names),
+            list(tgt_names),
+            list(mod_texts),
+            list(ref_bboxes),
+            list(target_instance_ids),
+            list(object_categories),
         )
 
     elif len(transposed_batch) == 6:
@@ -111,11 +180,23 @@ def extract_index_features(dataset: Union[CIRRDataset, FashionIQDataset, OACIRRD
     return index_features, index_names
 
 
-def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset, OACIRRDataset], blip_model, save_memory=False) -> Tuple[Tuple[torch.tensor, torch.tensor], List[str]]:
+def extract_index_blip_features(
+    dataset: Union[CIRRDataset, FashionIQDataset, OACIRRDataset],
+    blip_model,
+    save_memory=False,
+    batch_size=32,
+    num_workers=6,
+) -> Tuple[Tuple[torch.tensor, torch.tensor], List[str]]:
     """
         Extract OACIRR, FashionIQ or CIRR index features using Blip-2 Q-Former model
     """
-    classic_val_loader = DataLoader(dataset=dataset, batch_size=32, num_workers=6, pin_memory=True, collate_fn=collate_fn)
+    classic_val_loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
 
     index_features = []
     index_features_raw = []

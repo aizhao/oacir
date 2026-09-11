@@ -10,7 +10,7 @@ import PIL.Image
 import torchvision.transforms.functional as F
 import torch
 from PIL import ImageDraw
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 
 
@@ -248,6 +248,12 @@ OACIRR_VARIANT_CONFIGS = {
     'WO_Landmark': {'img_dir': 'OACIRR-CrossDomain/WO-Landmark', 'anno_dir': 'OACIRR-CrossDomain/WO-Landmark/oacirr-wo-landmark'},
 }
 
+
+def oacirr_instance_id(relative_path: str) -> str:
+    path = Path(relative_path)
+    return "/".join(path.parent.parts[-2:])
+
+
 class OACIRRDataset(Dataset):
     """
         The Unified Dataset Class for the OACIRR Benchmark
@@ -341,8 +347,8 @@ class OACIRRDataset(Dataset):
 
                     reference_image = self.preprocess(raw_reference_image)
                     target_image_path = self.img_root / self.name_to_relpath[target_name]
-                    target_image = self.preprocess(PIL.Image.open(target_image_path)).convert("RGB")
-
+                    # target_image = self.preprocess(PIL.Image.open(target_image_path)).convert("RGB")
+                    target_image = self.preprocess(PIL.Image.open(target_image_path).convert("RGB"))
                     reference_bbox = None
                     if self.highlight_training:
                         bounding_box = quadruple['reference_bounding_box']
@@ -354,7 +360,20 @@ class OACIRRDataset(Dataset):
                             final_size=self.pad_size
                         )
 
-                    return reference_image, target_image, reference_name, target_name, modification_text, reference_bbox
+                    target_instance_id = oacirr_instance_id(
+                        self.name_to_relpath[target_name]
+                    )
+                    object_category = quadruple["object_category"]
+                    return (
+                        reference_image,
+                        target_image,
+                        reference_name,
+                        target_name,
+                        modification_text,
+                        reference_bbox,
+                        target_instance_id,
+                        object_category,
+                    )
 
                 elif self.split == 'val':
                     group_names = quadruple.get('target_subset_vitG', None)
@@ -412,6 +431,291 @@ class OACIRRDataset(Dataset):
             else:
                 return len(self.name_to_relpath)
 
+
+class OACIRRFeatureDataset(OACIRRDataset):
+    """
+    OACIRR training dataset using precomputed raw visual_encoder embeddings.
+
+    It returns the same tuple structure as OACIRRDataset in relative-train mode:
+        reference_embed, target_embed, reference_name, target_name, modification_text, reference_bbox
+
+    Here reference_embed / target_embed are raw visual_encoder outputs before ln_vision.
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        variant: str,
+        split: str,
+        preprocess: callable,
+        cache_path: str,
+        highlight_training: bool = False,
+        text_entity: bool = False,
+        bounding_box_width: int = 0,
+        bounding_box_color: str = 'red',
+        bounding_box_crop: bool = False,
+    ):
+        assert split == "train", "OACIRRFeatureDataset is designed for train split first."
+
+        super().__init__(
+            data_root=data_root,
+            variant=variant,
+            split=split,
+            mode="relative",
+            preprocess=preprocess,
+            highlight_training=highlight_training,
+            highlight_inference=False,
+            text_entity=text_entity,
+            bounding_box_width=bounding_box_width,
+            bounding_box_color=bounding_box_color,
+            bounding_box_crop=bounding_box_crop,
+        )
+
+        print(f"Loading precomputed visual embeddings from: {cache_path}")
+        cache = torch.load(cache_path, map_location="cpu")
+
+        self.cache_names = cache["names"]
+        self.cache_embeds = cache["embeds"]
+        self.name_to_cache_idx = {name: idx for idx, name in enumerate(self.cache_names)}
+        self.name_to_size_cache = cache.get("name_to_size", None)
+
+        print(f"Loaded cached embeddings: {self.cache_embeds.shape}, dtype={self.cache_embeds.dtype}")
+
+    def __getitem__(self, index):
+        try:
+            quadruple = self.quadruples[index]
+
+            reference_name = quadruple["reference"]
+            target_name = quadruple["target"]
+            modification_text = quadruple["modification_text_mllm"]
+
+            if self.text_entity:
+                entity = quadruple["object_category"]
+                prompt_index = index % self.num_prompts
+                final_prompt = self.prompts[prompt_index].format(entity=entity)
+                modification_text = f"{final_prompt}, {modification_text}"
+
+            ref_idx = self.name_to_cache_idx[reference_name]
+            tgt_idx = self.name_to_cache_idx[target_name]
+
+            reference_embed = self.cache_embeds[ref_idx]
+            target_embed = self.cache_embeds[tgt_idx]
+
+            reference_bbox = None
+            if self.highlight_training:
+                bounding_box = quadruple["reference_bounding_box"]
+
+                if self.name_to_size_cache is not None:
+                    original_w, original_h = self.name_to_size_cache[reference_name]
+                else:
+                    reference_image_path = self.img_root / self.name_to_relpath[reference_name]
+                    raw_reference_image = PIL.Image.open(reference_image_path).convert("RGB")
+                    original_w, original_h = raw_reference_image.size
+
+                reference_bbox = transform_bbox_targetpad(
+                    bbox=bounding_box,
+                    original_size=(original_w, original_h),
+                    target_ratio=self.pad_ratio,
+                    final_size=self.pad_size,
+                )
+
+            target_instance_id = oacirr_instance_id(
+                self.name_to_relpath[target_name]
+            )
+            object_category = quadruple["object_category"]
+            return (
+                reference_embed,
+                target_embed,
+                reference_name,
+                target_name,
+                modification_text,
+                reference_bbox,
+                target_instance_id,
+                object_category,
+            )
+
+        except Exception as e:
+            print(f"Exception at index {index}: {e}")
+            return None
+
+
+class OACIRRTypedBatchSampler(Sampler):
+    """
+    Preserve the original quadruple distribution while adding typed companions.
+
+    Most samples are ordinary shuffled dataset rows. For selected ordinary
+    anchors, the sampler adds one same-instance/different-target companion and
+    one same-category/different-instance companion.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        drop_last: bool = True,
+        seed: int = 0,
+        typed_companion_fraction: float = 0.25,
+    ):
+        if batch_size < 8:
+            raise ValueError("Typed contrastive batch_size must be at least 8")
+        if not 0.0 < typed_companion_fraction < 1.0:
+            raise ValueError("typed_companion_fraction must be between 0 and 1")
+
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        typed_count = int(round(self.batch_size * typed_companion_fraction))
+        typed_count -= typed_count % 2
+        self.companion_pairs = max(1, typed_count // 2)
+        self.ordinary_count = self.batch_size - 2 * self.companion_pairs
+        if self.ordinary_count < self.companion_pairs:
+            raise ValueError("Too many typed companions for the configured batch size")
+
+        self.instance_to_indices = {}
+        self.category_to_instances = {}
+        self.index_to_instance = {}
+        self.index_to_category = {}
+        self.index_to_target = {}
+
+        for index, quadruple in enumerate(dataset.quadruples):
+            target_name = quadruple["target"]
+            instance_id = oacirr_instance_id(
+                dataset.name_to_relpath[target_name]
+            )
+            category = quadruple["object_category"]
+            self.instance_to_indices.setdefault(instance_id, []).append(index)
+            self.category_to_instances.setdefault(category, set()).add(instance_id)
+            self.index_to_instance[index] = instance_id
+            self.index_to_category[index] = category
+            self.index_to_target[index] = target_name
+
+        self.eligible_anchor_indices = []
+        for index in range(len(dataset.quadruples)):
+            instance_id = self.index_to_instance[index]
+            category = self.index_to_category[index]
+            target_name = self.index_to_target[index]
+            has_wrong_composition = any(
+                self.index_to_target[candidate] != target_name
+                for candidate in self.instance_to_indices[instance_id]
+            )
+            has_wrong_instance = any(
+                candidate_instance != instance_id
+                for candidate_instance in self.category_to_instances[category]
+            )
+            if has_wrong_composition and has_wrong_instance:
+                self.eligible_anchor_indices.append(index)
+
+        if len(self.eligible_anchor_indices) < self.companion_pairs:
+            raise ValueError("Not enough OACIRR rows are eligible for typed companions")
+        self.eligible_anchor_set = set(self.eligible_anchor_indices)
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    def _sample_wrong_composition(self, rng, anchor_index, used_indices):
+        instance_id = self.index_to_instance[anchor_index]
+        anchor_target = self.index_to_target[anchor_index]
+        candidates = [
+            index
+            for index in self.instance_to_indices[instance_id]
+            if self.index_to_target[index] != anchor_target
+            and index not in used_indices
+        ]
+        if not candidates:
+            candidates = [
+                index
+                for index in self.instance_to_indices[instance_id]
+                if self.index_to_target[index] != anchor_target
+            ]
+        return rng.choice(candidates)
+
+    def _sample_wrong_instance(self, rng, anchor_index, used_indices):
+        instance_id = self.index_to_instance[anchor_index]
+        category = self.index_to_category[anchor_index]
+        candidate_instances = [
+            candidate
+            for candidate in self.category_to_instances[category]
+            if candidate != instance_id
+        ]
+        rng.shuffle(candidate_instances)
+
+        for candidate_instance in candidate_instances:
+            candidates = [
+                index
+                for index in self.instance_to_indices[candidate_instance]
+                if index not in used_indices
+            ]
+            if candidates:
+                return rng.choice(candidates)
+
+        candidate_instance = rng.choice(candidate_instances)
+        return rng.choice(self.instance_to_indices[candidate_instance])
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+
+        shuffled_indices = list(range(len(self.dataset)))
+        rng.shuffle(shuffled_indices)
+        cursor = 0
+
+        for _ in range(len(self)):
+            if cursor + self.ordinary_count > len(shuffled_indices):
+                rng.shuffle(shuffled_indices)
+                cursor = 0
+
+            ordinary_indices = shuffled_indices[cursor:cursor + self.ordinary_count]
+            cursor += self.ordinary_count
+            used_indices = set(ordinary_indices)
+
+            anchor_candidates = [
+                index
+                for index in ordinary_indices
+                if index in self.eligible_anchor_set
+            ]
+            if len(anchor_candidates) < self.companion_pairs:
+                replacement_pool = [
+                    index
+                    for index in self.eligible_anchor_indices
+                    if index not in used_indices
+                ]
+                rng.shuffle(replacement_pool)
+                needed = self.companion_pairs - len(anchor_candidates)
+                non_anchor_positions = [
+                    position
+                    for position, index in enumerate(ordinary_indices)
+                    if index not in self.eligible_anchor_set
+                ]
+                for position, replacement in zip(non_anchor_positions[:needed], replacement_pool):
+                    used_indices.remove(ordinary_indices[position])
+                    ordinary_indices[position] = replacement
+                    used_indices.add(replacement)
+                    anchor_candidates.append(replacement)
+
+            anchors = rng.sample(anchor_candidates, self.companion_pairs)
+            batch_indices = list(ordinary_indices)
+            for anchor_index in anchors:
+                wrong_composition = self._sample_wrong_composition(
+                    rng,
+                    anchor_index,
+                    used_indices,
+                )
+                used_indices.add(wrong_composition)
+                wrong_instance = self._sample_wrong_instance(
+                    rng,
+                    anchor_index,
+                    used_indices,
+                )
+                used_indices.add(wrong_instance)
+                batch_indices.extend([wrong_composition, wrong_instance])
+
+            rng.shuffle(batch_indices)
+            yield batch_indices
 
 # ==========================================================================================
 # Standard CIR Benchmark Datasets
