@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import math
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
 from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2 import (
@@ -17,9 +18,128 @@ from lavis.models.blip2_models.blip2 import (
 )
 from lavis.models.blip2_models.oacir_latent_matching import (
     bbox_to_patch_mask as latent_bbox_to_patch_mask,
+    compute_bidirectional_region_scores,
     compute_anchor_target_maxsim,
     compute_anchor_target_ot,
 )
+
+
+class CoreSFEBlock(nn.Module):
+    """ConvNeXt-style semantic feature enhancement block used by CORE."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.depthwise = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pointwise_1 = nn.Linear(dim, 4 * dim)
+        self.pointwise_2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(1e-6 * torch.ones(dim))
+
+    def forward(self, features):
+        residual = features
+        features = self.depthwise(features).permute(0, 2, 3, 1)
+        features = self.pointwise_2(F.gelu(self.pointwise_1(self.norm(features))))
+        features = (self.gamma * features).permute(0, 3, 1, 2)
+        return residual + features
+
+
+class CoreReferenceRegionEncoder(nn.Module):
+    """CORE-style multi-subspace aggregation guided by the reference box."""
+
+    def __init__(self, embed_dim: int, num_regions: int = 16):
+        super().__init__()
+        mask_dim = max(embed_dim // 4, 16)
+        self.mask_encoder = nn.Sequential(
+            nn.Conv2d(1, mask_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(mask_dim, embed_dim, kernel_size=1),
+        )
+        self.sfe_blocks = nn.Sequential(
+            CoreSFEBlock(embed_dim),
+            CoreSFEBlock(embed_dim),
+            CoreSFEBlock(embed_dim),
+        )
+        self.activation_head = nn.Conv2d(embed_dim, num_regions, kernel_size=1)
+        self.num_regions = num_regions
+
+    def forward(self, patch_tokens, anchor_mask, bbox_floor: float = 0.05):
+        batch_size, num_patches, embed_dim = patch_tokens.shape
+        grid_size = int(math.sqrt(num_patches))
+        if grid_size * grid_size != num_patches:
+            raise ValueError(f"CORE region encoder requires a square patch grid, got {num_patches}")
+
+        feature_map = patch_tokens.transpose(1, 2).reshape(
+            batch_size,
+            embed_dim,
+            grid_size,
+            grid_size,
+        )
+        mask_map = anchor_mask.to(dtype=patch_tokens.dtype).reshape(
+            batch_size,
+            1,
+            grid_size,
+            grid_size,
+        )
+        enhanced_input = feature_map + self.mask_encoder(mask_map)
+        if self.training and torch.is_grad_enabled():
+            enhanced = checkpoint_sequential(
+                self.sfe_blocks,
+                len(self.sfe_blocks),
+                enhanced_input,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            enhanced = self.sfe_blocks(enhanced_input)
+        activation_logits = F.logsigmoid(self.activation_head(enhanced)).flatten(2)
+
+        # Keep CORE's learnable semantic activation while making the provided
+        # OACIR reference box an explicit spatial prior.
+        floor = min(max(float(bbox_floor), 1e-6), 1.0)
+        spatial_prior = floor + (1.0 - floor) * anchor_mask.to(patch_tokens.dtype)
+        activation_logits = activation_logits + spatial_prior.log().unsqueeze(1)
+        activation_weights = F.softmax(activation_logits, dim=-1)
+        pooled_regions = torch.einsum("bkn,bnd->bkd", activation_weights, patch_tokens)
+        # CORE averages the semantic subspaces before normalizing the single
+        # reference representation used by adaptive visual-text fusion.
+        pooled_feature = F.normalize(pooled_regions.mean(dim=1), dim=-1)
+        region_tokens = F.normalize(pooled_regions, dim=-1)
+        return region_tokens, pooled_feature, activation_weights
+
+
+class CoreAdaptiveFusion(nn.Module):
+    """CORE AVTI: channel-wise visual/text gates plus a dynamic scalar."""
+
+    def __init__(self, embed_dim: int, dropout: float = 0.5):
+        super().__init__()
+
+        def gate():
+            return nn.Sequential(
+                nn.Linear(2 * embed_dim, embed_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim, embed_dim),
+                nn.Sigmoid(),
+            )
+
+        self.visual_gate = gate()
+        self.text_gate = gate()
+        self.dynamic_scalar = nn.Sequential(
+            nn.Linear(2 * embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, reference_features, text_features):
+        text_features = text_features.to(dtype=reference_features.dtype)
+        combined = torch.cat([reference_features, text_features], dim=-1)
+        visual = self.visual_gate(combined) * reference_features
+        text = self.text_gate(combined) * text_features
+        alpha = self.dynamic_scalar(torch.cat([visual, text], dim=-1))
+        composed = alpha * visual + (1.0 - alpha) * text
+        return F.normalize(composed, dim=-1), alpha
 
 
 class ContextualReasoningModule(nn.Module):
@@ -152,6 +272,12 @@ class Blip2QformerOacirLatent(Blip2Base):
         nn.init.zeros_(self.bicm_preserve_mlp[-1].weight)
         nn.init.zeros_(self.bicm_preserve_mlp[-1].bias)
 
+        self.core_reference_encoder = CoreReferenceRegionEncoder(
+            embed_dim=embed_dim,
+            num_regions=16,
+        )
+        self.core_adaptive_fusion = CoreAdaptiveFusion(embed_dim=embed_dim)
+
         self.temp = nn.Parameter(0.07 * torch.ones([]))
         self.global_token_weights = nn.Parameter(torch.ones(num_query_token))
         self.global_margin = 0.1
@@ -172,6 +298,14 @@ class Blip2QformerOacirLatent(Blip2Base):
         self.bicm_lambda_ent = 0.01
         self.bicm_mask_floor = 0.1
         self.bicm_fusion_weight = 0.1
+        self.core_matcher_temp = 0.07
+        self.core_matcher_lambda_id = 0.5
+        self.core_matcher_fusion_weight = 0.02
+        self.core_matcher_topk = 50
+        self.core_matcher_cycle_weight = 0.25
+        self.core_matcher_text_weight = 0.25
+        self.core_matcher_bbox_floor = 0.05
+        self.core_matcher_query_chunk_size = 8
         self.region_topk = 16
         self.region_topk_max = 96
         self.region_area_scale = 1.5
@@ -224,6 +358,14 @@ class Blip2QformerOacirLatent(Blip2Base):
         bicm_lambda_ent=None,
         bicm_mask_floor=None,
         bicm_fusion_weight=None,
+        core_matcher_temp=None,
+        core_matcher_lambda_id=None,
+        core_matcher_fusion_weight=None,
+        core_matcher_topk=None,
+        core_matcher_cycle_weight=None,
+        core_matcher_text_weight=None,
+        core_matcher_bbox_floor=None,
+        core_matcher_query_chunk_size=None,
         region_topk=None,
         region_topk_max=None,
         region_area_scale=None,
@@ -243,8 +385,10 @@ class Blip2QformerOacirLatent(Blip2Base):
         if temp_ins is not None:
             self.temp_ins = float(temp_ins)
         if latent_matcher is not None:
-            if latent_matcher not in {"maxsim", "ot", "bicm"}:
-                raise ValueError("latent_matcher must be 'maxsim', 'ot', or 'bicm'")
+            if latent_matcher not in {"maxsim", "ot", "bicm", "core_matcher"}:
+                raise ValueError(
+                    "latent_matcher must be 'maxsim', 'ot', 'bicm', or 'core_matcher'"
+                )
             self.latent_matcher = latent_matcher
         if latent_chunk_size is not None:
             self.latent_chunk_size = int(latent_chunk_size)
@@ -274,6 +418,22 @@ class Blip2QformerOacirLatent(Blip2Base):
             self.bicm_mask_floor = float(bicm_mask_floor)
         if bicm_fusion_weight is not None:
             self.bicm_fusion_weight = float(bicm_fusion_weight)
+        if core_matcher_temp is not None:
+            self.core_matcher_temp = float(core_matcher_temp)
+        if core_matcher_lambda_id is not None:
+            self.core_matcher_lambda_id = float(core_matcher_lambda_id)
+        if core_matcher_fusion_weight is not None:
+            self.core_matcher_fusion_weight = float(core_matcher_fusion_weight)
+        if core_matcher_topk is not None:
+            self.core_matcher_topk = int(core_matcher_topk)
+        if core_matcher_cycle_weight is not None:
+            self.core_matcher_cycle_weight = float(core_matcher_cycle_weight)
+        if core_matcher_text_weight is not None:
+            self.core_matcher_text_weight = float(core_matcher_text_weight)
+        if core_matcher_bbox_floor is not None:
+            self.core_matcher_bbox_floor = float(core_matcher_bbox_floor)
+        if core_matcher_query_chunk_size is not None:
+            self.core_matcher_query_chunk_size = int(core_matcher_query_chunk_size)
         if region_topk is not None:
             self.region_topk = int(region_topk)
         if region_topk_max is not None:
@@ -545,6 +705,276 @@ class Blip2QformerOacirLatent(Blip2Base):
             device=device,
         )
 
+    @staticmethod
+    def _build_candidate_indices(similarity_logits, topk, force_positive=False):
+        """Select backbone candidates, optionally forcing aligned positives in."""
+        num_queries, num_targets = similarity_logits.shape
+        topk = min(max(int(topk), 1), num_targets)
+        with torch.no_grad():
+            candidate_indices = similarity_logits.detach().topk(topk, dim=1).indices
+            if force_positive:
+                if num_queries != num_targets:
+                    raise ValueError("Aligned positives require a square training score matrix")
+                targets = torch.arange(
+                    num_queries,
+                    dtype=torch.long,
+                    device=similarity_logits.device,
+                )
+                has_positive = (candidate_indices == targets.unsqueeze(1)).any(dim=1)
+                if not has_positive.all():
+                    candidate_indices = candidate_indices.clone()
+                    candidate_indices[~has_positive, -1] = targets[~has_positive]
+        return candidate_indices
+
+    def _compute_core_reference_features(
+        self,
+        reference_image_embeds_raw,
+        reference_bbox,
+        text_features,
+    ):
+        reference_tokens = self._project_raw_patch_tokens(reference_image_embeds_raw)
+        anchor_mask = self._build_anchor_mask(
+            reference_bbox=reference_bbox,
+            num_tokens=reference_image_embeds_raw.size(1),
+            batch_size=reference_image_embeds_raw.size(0),
+            device=reference_image_embeds_raw.device,
+        )
+        region_tokens, reference_feature, reference_attention = (
+            self.core_reference_encoder(
+                reference_tokens,
+                anchor_mask,
+                bbox_floor=self.core_matcher_bbox_floor,
+            )
+        )
+        composed_feature, fusion_scalar = self.core_adaptive_fusion(
+            reference_feature,
+            text_features,
+        )
+
+        num_target_patches = reference_tokens.size(1)
+        min_region_size = min(max(int(self.region_topk), 1), num_target_patches)
+        max_region_size = min(
+            max(int(self.region_topk_max), min_region_size),
+            num_target_patches,
+        )
+        region_sizes = (
+            anchor_mask.sum(dim=-1).to(dtype=torch.float32)
+            * float(self.region_area_scale)
+        ).round().long().clamp(min=min_region_size, max=max_region_size)
+        return {
+            "region_tokens": region_tokens,
+            "reference_feature": reference_feature,
+            "composed_feature": composed_feature,
+            "reference_attention": reference_attention,
+            "fusion_scalar": fusion_scalar,
+            "region_sizes": region_sizes,
+        }
+
+    def _compute_core_matcher_candidate_scores(
+        self,
+        reference_image_embeds_raw,
+        target_image_embeds_raw,
+        reference_bbox,
+        text_features,
+        candidate_indices=None,
+        return_heatmap=False,
+    ):
+        """Run CORE composition and Matcher discovery on selected candidates.
+
+        Training passes a shared target bank [T, N, D] plus candidate indices.
+        Exact gallery reranking passes already gathered candidates [B, C, N, D]
+        so only the global AdaFocal Top-K raw tokens need to reach the GPU.
+        """
+        core_reference = self._compute_core_reference_features(
+            reference_image_embeds_raw,
+            reference_bbox,
+            text_features,
+        )
+        if target_image_embeds_raw.dim() == 3:
+            if candidate_indices is None:
+                raise ValueError("candidate_indices are required for a shared target bank")
+            target_tokens = F.normalize(
+                self._project_raw_patch_tokens(target_image_embeds_raw),
+                dim=-1,
+            )
+            num_queries = candidate_indices.size(0)
+        elif target_image_embeds_raw.dim() == 4:
+            if candidate_indices is not None:
+                raise ValueError("candidate_indices must be omitted for gathered candidates")
+            if target_image_embeds_raw.size(0) != reference_image_embeds_raw.size(0):
+                raise ValueError("Gathered candidates must have one candidate bank per query")
+            target_tokens = None
+            num_queries = target_image_embeds_raw.size(0)
+        else:
+            raise ValueError("target_image_embeds_raw must be [T,N,D] or [B,C,N,D]")
+
+        output_keys = (
+            "score_id",
+            "score_comp",
+            "score_background",
+            "cycle_ratio",
+            "entropy",
+        )
+        collected = {key: [] for key in output_keys}
+        heatmaps = []
+        query_chunk_size = max(int(self.core_matcher_query_chunk_size), 1)
+
+        for start in range(0, num_queries, query_chunk_size):
+            end = min(start + query_chunk_size, num_queries)
+            if target_tokens is not None:
+                current_indices = candidate_indices[start:end]
+                reference_regions = core_reference["region_tokens"][start:end]
+                composed_features = core_reference["composed_feature"][start:end]
+                region_sizes = core_reference["region_sizes"][start:end]
+
+                if self.training and torch.is_grad_enabled():
+                    def checkpointed_matching(
+                        current_reference_regions,
+                        all_target_tokens,
+                        current_composed_features,
+                        current_region_sizes,
+                        current_candidate_indices,
+                    ):
+                        candidate_tokens = all_target_tokens[current_candidate_indices]
+                        matched = compute_bidirectional_region_scores(
+                            current_reference_regions,
+                            candidate_tokens,
+                            current_composed_features,
+                            current_region_sizes,
+                            spatial_kernel_size=self.region_spatial_kernel,
+                            spatial_weight=self.region_spatial_weight,
+                            region_temperature=self.region_temperature,
+                            cycle_weight=self.core_matcher_cycle_weight,
+                            text_weight=self.core_matcher_text_weight,
+                            return_heatmap=False,
+                        )
+                        return tuple(matched[key] for key in output_keys)
+
+                    checkpoint_outputs = checkpoint(
+                        checkpointed_matching,
+                        reference_regions,
+                        target_tokens,
+                        composed_features,
+                        region_sizes,
+                        current_indices,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                    chunk_outputs = dict(zip(output_keys, checkpoint_outputs))
+                else:
+                    candidate_tokens = target_tokens[current_indices]
+                    chunk_outputs = compute_bidirectional_region_scores(
+                        reference_regions,
+                        candidate_tokens,
+                        composed_features,
+                        region_sizes,
+                        spatial_kernel_size=self.region_spatial_kernel,
+                        spatial_weight=self.region_spatial_weight,
+                        region_temperature=self.region_temperature,
+                        cycle_weight=self.core_matcher_cycle_weight,
+                        text_weight=self.core_matcher_text_weight,
+                        return_heatmap=return_heatmap,
+                    )
+            else:
+                raw_candidates = target_image_embeds_raw[start:end].to(
+                    reference_image_embeds_raw.device,
+                    non_blocking=True,
+                )
+                raw_shape = raw_candidates.shape
+                candidate_tokens = self._project_raw_patch_tokens(
+                    raw_candidates.reshape(-1, raw_shape[-2], raw_shape[-1])
+                )
+                candidate_tokens = F.normalize(candidate_tokens, dim=-1).reshape(
+                    raw_shape[0],
+                    raw_shape[1],
+                    raw_shape[-2] - 1,
+                    -1,
+                )
+                chunk_outputs = compute_bidirectional_region_scores(
+                    core_reference["region_tokens"][start:end],
+                    candidate_tokens,
+                    core_reference["composed_feature"][start:end],
+                    core_reference["region_sizes"][start:end],
+                    spatial_kernel_size=self.region_spatial_kernel,
+                    spatial_weight=self.region_spatial_weight,
+                    region_temperature=self.region_temperature,
+                    cycle_weight=self.core_matcher_cycle_weight,
+                    text_weight=self.core_matcher_text_weight,
+                    return_heatmap=return_heatmap,
+                )
+            for key in output_keys:
+                collected[key].append(chunk_outputs[key])
+            if return_heatmap:
+                heatmaps.append(chunk_outputs["target_attention"])
+
+        outputs = {key: torch.cat(value, dim=0) for key, value in collected.items()}
+        outputs["score_final"] = (
+            outputs["score_comp"]
+            + float(self.core_matcher_lambda_id) * outputs["score_id"]
+        )
+        outputs["reference_attention"] = core_reference["reference_attention"]
+        outputs["fusion_scalar"] = core_reference["fusion_scalar"]
+        if return_heatmap:
+            outputs["target_attention"] = torch.cat(heatmaps, dim=0)
+        return outputs
+
+    def fuse_core_matcher_scores(self, composition_logits, core_matcher_logits, topk=None):
+        """Apply CORE-Matcher strictly inside the backbone's global Top-K."""
+        if topk is None:
+            topk = self.core_matcher_topk
+        candidate_indices = self._build_candidate_indices(
+            composition_logits,
+            topk=topk,
+            force_positive=False,
+        )
+        candidate_mask = torch.zeros_like(composition_logits, dtype=torch.bool)
+        candidate_mask.scatter_(1, candidate_indices, True)
+        residual = core_matcher_logits.masked_fill(~candidate_mask, 0.0)
+        return (
+            composition_logits
+            + float(self.core_matcher_fusion_weight) * residual
+        )
+
+    @staticmethod
+    def merge_topk_ranking(
+        composition_logits,
+        candidate_indices,
+        reranked_candidate_logits,
+    ):
+        """Merge reranked candidates while preserving the original Top-K set."""
+        if candidate_indices.shape != reranked_candidate_logits.shape:
+            raise ValueError("Candidate indices and reranked logits must have the same shape")
+        if composition_logits.size(0) != candidate_indices.size(0):
+            raise ValueError("Composition and candidate batch sizes must match")
+
+        num_queries, num_targets = composition_logits.shape
+        candidate_mask = torch.zeros_like(composition_logits, dtype=torch.bool)
+        candidate_mask.scatter_(1, candidate_indices, True)
+
+        reranked_order = reranked_candidate_logits.argsort(dim=1, descending=True)
+        ordered_candidates = torch.gather(candidate_indices, 1, reranked_order)
+
+        backbone_order = composition_logits.argsort(dim=1, descending=True)
+        ordered_candidate_mask = torch.gather(candidate_mask, 1, backbone_order)
+        ordered_non_candidates = backbone_order[~ordered_candidate_mask].reshape(
+            num_queries,
+            num_targets - candidate_indices.size(1),
+        )
+        final_order = torch.cat([ordered_candidates, ordered_non_candidates], dim=1)
+
+        # Validation consumes only ranking. Integer-spaced values avoid any
+        # accidental tie at the Top-K boundary while retaining that exact order.
+        rank_values = torch.arange(
+            num_targets,
+            0,
+            -1,
+            device=composition_logits.device,
+            dtype=composition_logits.dtype,
+        ).unsqueeze(0).expand(num_queries, -1)
+        merged_scores = torch.empty_like(composition_logits)
+        merged_scores.scatter_(1, final_order, rank_values)
+        return merged_scores
+
     def _compute_instance_scores(
         self,
         reference_image_embeds_raw,
@@ -604,20 +1034,11 @@ class Blip2QformerOacirLatent(Blip2Base):
         topk = min(max(int(self.ot_topk), 1), batch_size)
         if topk >= batch_size:
             return None
-
-        with torch.no_grad():
-            candidate_indices = sim_comp_logits.detach().topk(topk, dim=1).indices
-            targets = torch.arange(
-                batch_size,
-                dtype=torch.long,
-                device=sim_comp_logits.device,
-            )
-            has_positive = (candidate_indices == targets.unsqueeze(1)).any(dim=1)
-            if not has_positive.all():
-                candidate_indices = candidate_indices.clone()
-                candidate_indices[~has_positive, -1] = targets[~has_positive]
-
-        return candidate_indices
+        return self._build_candidate_indices(
+            sim_comp_logits,
+            topk=topk,
+            force_positive=True,
+        )
 
     def _compute_candidate_instance_scores(
         self,
@@ -945,6 +1366,84 @@ class Blip2QformerOacirLatent(Blip2Base):
             loss_align = loss_comp
             loss_dict["loss_align"] = loss_align
 
+            if self.latent_matcher == "core_matcher":
+                candidate_indices = self._build_candidate_indices(
+                    sim_comp_logits,
+                    topk=self.core_matcher_topk,
+                    force_positive=True,
+                )
+                core_scores = self._compute_core_matcher_candidate_scores(
+                    reference_raw,
+                    target_raw,
+                    reference_bbox,
+                    text_features,
+                    candidate_indices,
+                    return_heatmap=False,
+                )
+                candidate_targets = (
+                    candidate_indices == targets.unsqueeze(1)
+                ).long().argmax(dim=1)
+                final_logits = core_scores["score_final"] / self.core_matcher_temp
+                identity_logits = core_scores["score_id"] / self.core_matcher_temp
+                composition_logits = core_scores["score_comp"] / self.core_matcher_temp
+                backbone_candidate_logits = torch.gather(
+                    sim_comp_logits,
+                    dim=1,
+                    index=candidate_indices,
+                )
+                reranking_logits = (
+                    backbone_candidate_logits
+                    + float(self.core_matcher_fusion_weight) * final_logits
+                )
+
+                loss_dict["loss_core_matcher"] = F.cross_entropy(
+                    reranking_logits,
+                    candidate_targets,
+                )
+                loss_dict["loss_core_comp"] = F.cross_entropy(
+                    composition_logits,
+                    candidate_targets,
+                )
+
+                if typed_masks is not None:
+                    identity_positive = torch.gather(
+                        typed_masks["instance_positive"],
+                        dim=1,
+                        index=candidate_indices,
+                    )
+                    identity_negative = torch.gather(
+                        typed_masks["wrong_instance"] | typed_masks["mixed_negative"],
+                        dim=1,
+                        index=candidate_indices,
+                    )
+                    loss_dict["loss_core_id"] = self._masked_multi_positive_nce(
+                        identity_logits,
+                        identity_positive,
+                        identity_negative,
+                    )
+                else:
+                    loss_dict["loss_core_id"] = F.cross_entropy(
+                        identity_logits,
+                        candidate_targets,
+                    )
+
+                positive_composition = torch.gather(
+                    core_scores["score_comp"],
+                    dim=1,
+                    index=candidate_targets.unsqueeze(1),
+                ).squeeze(1)
+                positive_background = torch.gather(
+                    core_scores["score_background"],
+                    dim=1,
+                    index=candidate_targets.unsqueeze(1),
+                ).squeeze(1)
+                loss_foreground = 1.0 - positive_composition
+                loss_background = 1.0 + positive_background
+                loss_dict["loss_core_region"] = (
+                    loss_foreground + loss_background
+                ).mean()
+                return loss_dict
+
             if self.latent_matcher == "bicm":
                 bicm_scores = self._compute_bicm_scores(
                     reference_raw,
@@ -1070,6 +1569,90 @@ class Blip2QformerOacirLatent(Blip2Base):
         return self._compute_composition_scores(fusion_features, target_features)
 
     @torch.no_grad()
+    def inference_composition_from_raw(
+        self,
+        reference_image_embeds_raw,
+        target_features,
+        modification_text,
+        reference_bbox=None,
+    ):
+        """Compute AdaFocal logits without running a latent matcher."""
+        device = self._get_device()
+        reference_image_embeds_raw = reference_image_embeds_raw.to(
+            device,
+            non_blocking=True,
+        )
+        target_features = target_features.to(device, non_blocking=True)
+        reference_image_embeds = self.ln_vision(
+            reference_image_embeds_raw.to(dtype=self.ln_vision.weight.dtype)
+        )
+        fusion_features = self._compute_fusion_features(
+            reference_image_embeds,
+            modification_text,
+            reference_bbox,
+        )
+        return self._compute_composition_scores(fusion_features, target_features) / self.temp
+
+    @torch.no_grad()
+    def inference_core_matcher_candidates(
+        self,
+        reference_image_embeds_raw,
+        target_candidate_embeds_raw,
+        composition_candidate_logits,
+        modification_text,
+        reference_bbox,
+        return_parts=False,
+        return_heatmap=False,
+    ):
+        """Rerank already gathered global AdaFocal Top-K candidates."""
+        if self.latent_matcher != "core_matcher":
+            raise RuntimeError("This API requires latent_matcher='core_matcher'")
+
+        device = self._get_device()
+        reference_image_embeds_raw = reference_image_embeds_raw.to(
+            device,
+            non_blocking=True,
+        )
+        text_features = self._compute_text_features(modification_text, device)
+        core_scores = self._compute_core_matcher_candidate_scores(
+            reference_image_embeds_raw,
+            target_candidate_embeds_raw,
+            reference_bbox,
+            text_features,
+            candidate_indices=None,
+            return_heatmap=return_heatmap,
+        )
+        core_matcher_logits = core_scores["score_final"] / self.core_matcher_temp
+        composition_candidate_logits = composition_candidate_logits.to(
+            device=device,
+            dtype=core_matcher_logits.dtype,
+            non_blocking=True,
+        )
+        reranked_logits = (
+            composition_candidate_logits
+            + float(self.core_matcher_fusion_weight) * core_matcher_logits
+        )
+
+        if not return_parts:
+            return reranked_logits
+
+        outputs = {
+            "sim_final": reranked_logits,
+            "sim_core_matcher": core_matcher_logits,
+            "sim_id": core_scores["score_id"] / self.core_matcher_temp,
+            "sim_region_comp": core_scores["score_comp"] / self.core_matcher_temp,
+            "fusion_scalar": core_scores["fusion_scalar"],
+            "cycle_ratio": core_scores["cycle_ratio"],
+            "region_entropy": core_scores["entropy"],
+        }
+        if return_heatmap:
+            outputs["target_patch_heatmap"] = core_scores["target_attention"]
+            outputs["reference_patch_attention"] = core_scores[
+                "reference_attention"
+            ]
+        return outputs
+
+    @torch.no_grad()
     def inference_with_latent_matching(
         self,
         reference_image_embeds_raw,
@@ -1095,6 +1678,61 @@ class Blip2QformerOacirLatent(Blip2Base):
 
         sim_comp = self._compute_composition_scores(fusion_features, target_features)
         sim_comp_logits = sim_comp / self.temp
+
+        if self.latent_matcher == "core_matcher":
+            candidate_indices = self._build_candidate_indices(
+                sim_comp_logits,
+                topk=self.core_matcher_topk,
+                force_positive=False,
+            )
+            core_scores = self._compute_core_matcher_candidate_scores(
+                reference_image_embeds_raw,
+                target_image_embeds_raw,
+                reference_bbox,
+                text_features,
+                candidate_indices,
+                return_heatmap=return_heatmap,
+            )
+
+            def scatter_candidate_scores(candidate_scores):
+                full_scores = torch.zeros_like(sim_comp_logits)
+                full_scores.scatter_(1, candidate_indices, candidate_scores)
+                return full_scores
+
+            core_matcher_logits = scatter_candidate_scores(
+                core_scores["score_final"] / self.core_matcher_temp
+            )
+            identity_logits = scatter_candidate_scores(
+                core_scores["score_id"] / self.core_matcher_temp
+            )
+            region_composition_logits = scatter_candidate_scores(
+                core_scores["score_comp"] / self.core_matcher_temp
+            )
+            sim_final_logits = self.fuse_core_matcher_scores(
+                sim_comp_logits,
+                core_matcher_logits,
+            )
+
+            if return_parts:
+                outputs = {
+                    "sim_final": sim_final_logits,
+                    "sim_comp": sim_comp_logits,
+                    "sim_core_matcher": core_matcher_logits,
+                    "sim_id": identity_logits,
+                    "sim_region_comp": region_composition_logits,
+                    "candidate_indices": candidate_indices,
+                    "fusion_scalar": core_scores["fusion_scalar"],
+                    "cycle_ratio": core_scores["cycle_ratio"],
+                    "region_entropy": core_scores["entropy"],
+                }
+                if return_heatmap:
+                    outputs["target_patch_heatmap"] = core_scores["target_attention"]
+                    outputs["reference_patch_attention"] = core_scores[
+                        "reference_attention"
+                    ]
+                return outputs
+
+            return sim_final_logits
 
         if self.latent_matcher == "bicm":
             bicm_scores = self._compute_bicm_scores(

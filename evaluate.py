@@ -796,7 +796,10 @@ def generate_oacirr_val_predictions_latent(
                 reference_raw_embeds = torch.stack(itemgetter(*batch_reference_names)(name_to_raw))
 
             sim_chunks = []
+            composition_chunks = []
             activation_scalar_for_batch = None
+            latent_model = blip_model.module if hasattr(blip_model, "module") else blip_model
+            use_core_matcher = getattr(latent_model, "latent_matcher", None) == "core_matcher"
 
             # Latent matching needs reference bboxes. We always pass bboxes here.
             reference_bbox = batch_reference_bbox
@@ -805,8 +808,18 @@ def generate_oacirr_val_predictions_latent(
                 end = min(start + latent_gallery_chunk_size, num_gallery)
 
                 feature_chunk = index_features[start:end]
-                raw_chunk = index_raw_embeds[start:end]
 
+                if use_core_matcher:
+                    composition_chunk = latent_model.inference_composition_from_raw(
+                        reference_image_embeds_raw=reference_raw_embeds,
+                        target_features=feature_chunk,
+                        modification_text=captions,
+                        reference_bbox=reference_bbox,
+                    )
+                    composition_chunks.append(composition_chunk.detach().cpu())
+                    continue
+
+                raw_chunk = index_raw_embeds[start:end]
                 model_output = blip_model.inference_with_latent_matching(
                     reference_image_embeds_raw=reference_raw_embeds,
                     target_features=feature_chunk,
@@ -819,12 +832,44 @@ def generate_oacirr_val_predictions_latent(
                 if isinstance(model_output, tuple):
                     sim_chunk, activation_scalar = model_output
                     activation_scalar_for_batch = activation_scalar
+                    sim_chunks.append(sim_chunk.detach().cpu())
                 else:
                     sim_chunk = model_output
+                    sim_chunks.append(sim_chunk.detach().cpu())
 
-                sim_chunks.append(sim_chunk.detach().cpu())
-
-            batch_distance = torch.cat(sim_chunks, dim=1)
+            if use_core_matcher:
+                global_composition = torch.cat(composition_chunks, dim=1)
+                candidate_count = min(
+                    max(int(latent_model.core_matcher_topk), 1),
+                    global_composition.size(1),
+                )
+                candidate_indices = global_composition.topk(
+                    candidate_count,
+                    dim=1,
+                ).indices
+                raw_candidate_indices = candidate_indices.to(index_raw_embeds.device)
+                target_candidate_raw = index_raw_embeds[raw_candidate_indices]
+                composition_candidate_logits = torch.gather(
+                    global_composition,
+                    dim=1,
+                    index=candidate_indices,
+                )
+                rerank_output = latent_model.inference_core_matcher_candidates(
+                    reference_image_embeds_raw=reference_raw_embeds,
+                    target_candidate_embeds_raw=target_candidate_raw,
+                    composition_candidate_logits=composition_candidate_logits,
+                    modification_text=captions,
+                    reference_bbox=reference_bbox,
+                    return_parts=True,
+                )
+                batch_distance = latent_model.merge_topk_ranking(
+                    global_composition,
+                    candidate_indices,
+                    rerank_output["sim_final"].detach().cpu(),
+                )
+                activation_scalar_for_batch = rerank_output["fusion_scalar"]
+            else:
+                batch_distance = torch.cat(sim_chunks, dim=1)
             distance.append(batch_distance)
 
             if activation_scalar_for_batch is not None:
@@ -1175,7 +1220,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--latent-matcher",
         default="bicm",
-        choices=["maxsim", "ot", "bicm"],
+        choices=["maxsim", "ot", "bicm", "core_matcher"],
         help="Latent instance matcher used in the final score",
     )
     parser.add_argument(
@@ -1237,6 +1282,54 @@ if __name__ == "__main__":
         default=0.1,
         type=float,
         help="Residual weight for adding BICM logits to backbone composition logits",
+    )
+    parser.add_argument(
+        "--core-matcher-temp",
+        default=0.07,
+        type=float,
+        help="Temperature for CORE-Matcher candidate logits",
+    )
+    parser.add_argument(
+        "--core-matcher-lambda-id",
+        default=0.5,
+        type=float,
+        help="Identity weight inside the CORE-Matcher reranking score",
+    )
+    parser.add_argument(
+        "--core-matcher-fusion-weight",
+        default=0.02,
+        type=float,
+        help="Residual CORE-Matcher weight inside AdaFocal Top-K",
+    )
+    parser.add_argument(
+        "--core-matcher-topk",
+        default=50,
+        type=int,
+        help="Number of global AdaFocal candidates reranked by CORE-Matcher",
+    )
+    parser.add_argument(
+        "--core-matcher-cycle-weight",
+        default=0.25,
+        type=float,
+        help="Weight of Matcher-style bidirectional cycle consistency",
+    )
+    parser.add_argument(
+        "--core-matcher-text-weight",
+        default=0.25,
+        type=float,
+        help="Text-composition contribution to target-region discovery",
+    )
+    parser.add_argument(
+        "--core-matcher-bbox-floor",
+        default=0.05,
+        type=float,
+        help="Context floor outside the reference box in CORE aggregation",
+    )
+    parser.add_argument(
+        "--core-matcher-query-chunk-size",
+        default=8,
+        type=int,
+        help="Query chunk size for memory-bounded candidate region matching",
     )
     parser.add_argument(
         "--latent-gallery-chunk-size",
@@ -1315,6 +1408,14 @@ if __name__ == "__main__":
             bicm_lambda_ent=args.bicm_lambda_ent,
             bicm_mask_floor=args.bicm_mask_floor,
             bicm_fusion_weight=args.bicm_fusion_weight,
+            core_matcher_temp=args.core_matcher_temp,
+            core_matcher_lambda_id=args.core_matcher_lambda_id,
+            core_matcher_fusion_weight=args.core_matcher_fusion_weight,
+            core_matcher_topk=args.core_matcher_topk,
+            core_matcher_cycle_weight=args.core_matcher_cycle_weight,
+            core_matcher_text_weight=args.core_matcher_text_weight,
+            core_matcher_bbox_floor=args.core_matcher_bbox_floor,
+            core_matcher_query_chunk_size=args.core_matcher_query_chunk_size,
             region_topk=args.region_topk,
             region_topk_max=args.region_topk_max,
             region_area_scale=args.region_area_scale,

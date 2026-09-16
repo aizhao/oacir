@@ -104,6 +104,14 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             bicm_lambda_ent=kwargs.get("bicm_lambda_ent", 0.01),
             bicm_mask_floor=kwargs.get("bicm_mask_floor", 0.1),
             bicm_fusion_weight=kwargs.get("bicm_fusion_weight", 0.1),
+            core_matcher_temp=kwargs.get("core_matcher_temp", 0.07),
+            core_matcher_lambda_id=kwargs.get("core_matcher_lambda_id", 0.5),
+            core_matcher_fusion_weight=kwargs.get("core_matcher_fusion_weight", 0.02),
+            core_matcher_topk=kwargs.get("core_matcher_topk", 50),
+            core_matcher_cycle_weight=kwargs.get("core_matcher_cycle_weight", 0.25),
+            core_matcher_text_weight=kwargs.get("core_matcher_text_weight", 0.25),
+            core_matcher_bbox_floor=kwargs.get("core_matcher_bbox_floor", 0.05),
+            core_matcher_query_chunk_size=kwargs.get("core_matcher_query_chunk_size", 8),
             region_topk=kwargs.get("region_topk", 16),
             region_topk_max=kwargs.get("region_topk_max", 96),
             region_area_scale=kwargs.get("region_area_scale", 1.5),
@@ -343,6 +351,7 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
                         txt_processors=txt_processors,
                         save_memory=save_memory,
                         latent_gallery_chunk_size=kwargs.get("latent_gallery_chunk_size", 1024),
+                        eval_batch_size=kwargs.get("val_query_batch_size", 16),
                     )
                 else:
                     val_index_features, val_index_names = extract_index_blip_features(classic_val_dataset, blip_model, save_memory)
@@ -777,6 +786,18 @@ if __name__ == '__main__':
         default=32,
         help="Batch size for rebuilding current Q-Former gallery features from val raw cache.",
     )
+    parser.add_argument(
+        "--latent-gallery-chunk-size",
+        type=int,
+        default=1024,
+        help="Gallery chunk size for the AdaFocal first-stage validation scan.",
+    )
+    parser.add_argument(
+        "--val-query-batch-size",
+        type=int,
+        default=16,
+        help="Query batch size for latent validation and Top-K reranking.",
+    )
 
     parser.add_argument("--lambda-ins", default=0.2, type=float,
                     help="Weight of target-side latent instance score in final logits")
@@ -794,9 +815,17 @@ if __name__ == '__main__':
                         help="Weight of the BICM edit direction loss")
     parser.add_argument("--loss-ent", default=0.0, type=float,
                         help="Weight of the BICM target attention entropy loss")
+    parser.add_argument("--loss-core-matcher", default=0.0, type=float,
+                        help="Weight of CORE-Matcher candidate reranking loss")
+    parser.add_argument("--loss-core-id", default=0.0, type=float,
+                        help="Weight of bidirectional latent-region identity loss")
+    parser.add_argument("--loss-core-comp", default=0.0, type=float,
+                        help="Weight of CORE region-level composition loss")
+    parser.add_argument("--loss-core-region", default=0.0, type=float,
+                        help="Weight of CORE foreground/background contrastive loss")
     parser.add_argument("--latent-chunk-size", default=256, type=int,
                         help="Chunk size for latent target matching")
-    parser.add_argument("--latent-matcher", default="bicm", choices=["maxsim", "ot", "bicm"],
+    parser.add_argument("--latent-matcher", default="bicm", choices=["maxsim", "ot", "bicm", "core_matcher"],
                         help="Latent instance matcher used in the final score")
     parser.add_argument("--ot-sinkhorn-iters", default=20, type=int,
                         help="Number of log-domain Sinkhorn iterations for OT latent matching")
@@ -820,6 +849,22 @@ if __name__ == '__main__':
                         help="Lower bound for text-conditioned preservation mask values")
     parser.add_argument("--bicm-fusion-weight", default=0.1, type=float,
                         help="Residual weight for adding BICM logits to backbone composition logits")
+    parser.add_argument("--core-matcher-temp", default=0.07, type=float,
+                        help="Temperature for CORE-Matcher candidate logits")
+    parser.add_argument("--core-matcher-lambda-id", default=0.5, type=float,
+                        help="Identity weight inside the CORE-Matcher reranking score")
+    parser.add_argument("--core-matcher-fusion-weight", default=0.02, type=float,
+                        help="Residual CORE-Matcher weight inside AdaFocal Top-K")
+    parser.add_argument("--core-matcher-topk", default=50, type=int,
+                        help="Number of AdaFocal candidates reranked by CORE-Matcher")
+    parser.add_argument("--core-matcher-cycle-weight", default=0.25, type=float,
+                        help="Weight of Matcher-style bidirectional cycle consistency")
+    parser.add_argument("--core-matcher-text-weight", default=0.25, type=float,
+                        help="Text-composition contribution to target-region discovery")
+    parser.add_argument("--core-matcher-bbox-floor", default=0.05, type=float,
+                        help="Context floor outside the reference box in CORE aggregation")
+    parser.add_argument("--core-matcher-query-chunk-size", default=8, type=int,
+                        help="Query chunk size for memory-bounded candidate region matching")
     parser.add_argument("--region-topk", default=16, type=int,
                         help="Minimum target patch count retained by adaptive region selection")
     parser.add_argument("--region-topk-max", default=96, type=int,
@@ -893,6 +938,8 @@ if __name__ == '__main__':
         "train_feature_cache": args.train_feature_cache,
         "val_feature_cache": args.val_feature_cache,
         "val_feature_batch_size": args.val_feature_batch_size,
+        "latent_gallery_chunk_size": args.latent_gallery_chunk_size,
+        "val_query_batch_size": args.val_query_batch_size,
         "lambda_ins": args.lambda_ins,
         "temp_ins": args.temp_ins,
         "loss_ins": args.loss_ins,
@@ -901,6 +948,10 @@ if __name__ == '__main__':
         "loss_id": args.loss_id,
         "loss_edit": args.loss_edit,
         "loss_ent": args.loss_ent,
+        "loss_core_matcher": args.loss_core_matcher,
+        "loss_core_id": args.loss_core_id,
+        "loss_core_comp": args.loss_core_comp,
+        "loss_core_region": args.loss_core_region,
         "latent_chunk_size": args.latent_chunk_size,
         "latent_matcher": args.latent_matcher,
         "ot_sinkhorn_iters": args.ot_sinkhorn_iters,
@@ -914,6 +965,14 @@ if __name__ == '__main__':
         "bicm_lambda_ent": args.bicm_lambda_ent,
         "bicm_mask_floor": args.bicm_mask_floor,
         "bicm_fusion_weight": args.bicm_fusion_weight,
+        "core_matcher_temp": args.core_matcher_temp,
+        "core_matcher_lambda_id": args.core_matcher_lambda_id,
+        "core_matcher_fusion_weight": args.core_matcher_fusion_weight,
+        "core_matcher_topk": args.core_matcher_topk,
+        "core_matcher_cycle_weight": args.core_matcher_cycle_weight,
+        "core_matcher_text_weight": args.core_matcher_text_weight,
+        "core_matcher_bbox_floor": args.core_matcher_bbox_floor,
+        "core_matcher_query_chunk_size": args.core_matcher_query_chunk_size,
         "region_topk": args.region_topk,
         "region_topk_max": args.region_topk_max,
         "region_area_scale": args.region_area_scale,
