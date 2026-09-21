@@ -6,6 +6,7 @@
 """
 
 import json
+import inspect
 import time
 from argparse import ArgumentParser
 from operator import itemgetter
@@ -130,7 +131,10 @@ def extract_index_blip_features_from_raw_cache(
         )
 
     print(f"Loading validation raw visual embeddings from: {cache_path}")
-    cache = torch.load(cache_path, map_location="cpu")
+    load_kwargs = {"map_location": "cpu"}
+    if "mmap" in inspect.signature(torch.load).parameters:
+        load_kwargs["mmap"] = True
+    cache = torch.load(cache_path, **load_kwargs)
     cache_names = list(cache["names"])
     cache_embeds = cache["embeds"]
     cache_meta = cache.get("meta", {})
@@ -152,9 +156,9 @@ def extract_index_blip_features_from_raw_cache(
     if len(cache_names) != len(set(cache_names)):
         raise ValueError(f"Validation cache contains duplicate image names: {cache_path}")
 
-    desired_names = list(classic_val_dataset.name_to_relpath.keys())
-    name_to_cache_idx = {name: idx for idx, name in enumerate(cache_names)}
-    missing_names = [name for name in desired_names if name not in name_to_cache_idx]
+    dataset_names = list(classic_val_dataset.name_to_relpath.keys())
+    cache_name_set = set(cache_names)
+    missing_names = [name for name in dataset_names if name not in cache_name_set]
     if missing_names:
         preview = ", ".join(missing_names[:5])
         raise KeyError(
@@ -162,12 +166,23 @@ def extract_index_blip_features_from_raw_cache(
             f"for {expected_variant}: {preview}"
         )
 
-    cache_indices = torch.tensor(
-        [name_to_cache_idx[name] for name in desired_names],
-        dtype=torch.long,
-    )
-    index_raw_embeds = cache_embeds.index_select(0, cache_indices)
-    index_raw_embeds = index_raw_embeds.to(dtype=torch.float16)
+    if len(cache_names) == len(dataset_names) and cache_name_set == set(dataset_names):
+        # Retrieval metrics do not depend on gallery order. Keeping the cache's
+        # native order avoids duplicating the multi-GB raw embedding tensor.
+        desired_names = cache_names
+        index_raw_embeds = cache_embeds
+    else:
+        desired_names = dataset_names
+        name_to_cache_idx = {name: idx for idx, name in enumerate(cache_names)}
+        cache_indices = torch.tensor(
+            [name_to_cache_idx[name] for name in desired_names],
+            dtype=torch.long,
+        )
+        index_raw_embeds = cache_embeds.index_select(0, cache_indices)
+
+    if index_raw_embeds.dtype != torch.float16:
+        index_raw_embeds = index_raw_embeds.to(dtype=torch.float16)
+    del cache, cache_embeds
 
     index_features = []
     blip_model.eval()
@@ -580,39 +595,81 @@ def _compute_oacirr_metrics_from_predictions(
     """
     print(f"Computing OACIRR [{relative_val_dataset.variant}] validation metrics...")
 
-    distances = 1 - pred_sim
-    sorted_indices = torch.argsort(distances, dim=-1)
-    sorted_index_names = np.array(index_names)[sorted_indices]
+    if pred_sim.size(0) != len(target_names) or pred_sim.size(1) != len(index_names):
+        raise ValueError(
+            "Prediction matrix shape does not match query/gallery metadata: "
+            f"pred_sim={tuple(pred_sim.shape)}, queries={len(target_names)}, "
+            f"gallery={len(index_names)}"
+        )
 
-    reference_mask = torch.tensor(
-        sorted_index_names
-        != np.repeat(np.array(reference_names), len(index_names)).reshape(len(target_names), -1)
-    )
-    sorted_index_names = sorted_index_names[reference_mask].reshape(
-        sorted_index_names.shape[0],
-        sorted_index_names.shape[1] - 1,
-    )
+    name_to_index = {name: idx for idx, name in enumerate(index_names)}
+    try:
+        reference_indices = torch.tensor(
+            [name_to_index[name] for name in reference_names],
+            dtype=torch.long,
+            device=pred_sim.device,
+        )
+        target_indices = torch.tensor(
+            [name_to_index[name] for name in target_names],
+            dtype=torch.long,
+            device=pred_sim.device,
+        )
+    except KeyError as error:
+        raise KeyError(f"Validation image is missing from gallery: {error.args[0]}") from error
 
-    labels = torch.tensor(
-        sorted_index_names
-        == np.repeat(np.array(target_names), len(index_names) - 1).reshape(len(target_names), -1)
-    )
+    # The metrics only use ranks up to 50. Excluding the reference in-place and
+    # selecting Top-50 avoids full argsort tensors and a huge string matrix.
+    query_indices = torch.arange(pred_sim.size(0), device=pred_sim.device)
+    pred_sim[query_indices, reference_indices] = -torch.inf
+    if pred_sim.size(1) < 2:
+        raise ValueError("OACIRR metrics require at least two gallery images")
+    metric_topk = min(50, pred_sim.size(1) - 1)
+    top_index_chunks = []
+    metric_query_chunk_size = 256
+    for start in range(0, pred_sim.size(0), metric_query_chunk_size):
+        end = min(start + metric_query_chunk_size, pred_sim.size(0))
+        top_index_chunks.append(
+            torch.topk(
+                pred_sim[start:end],
+                k=metric_topk,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            ).indices.cpu()
+        )
+    top_indices = torch.cat(top_index_chunks, dim=0)
+    target_indices = target_indices.cpu().unsqueeze(1)
+    labels = top_indices.eq(target_indices)
 
-    assert torch.equal(
-        torch.sum(labels, dim=-1).int(),
-        torch.ones(len(target_names)).int(),
+    name_to_folder = {
+        name: path.split("/")[-2]
+        for name, path in relative_val_dataset.name_to_relpath.items()
+    }
+    folder_to_index = {
+        folder: idx
+        for idx, folder in enumerate(dict.fromkeys(name_to_folder.values()))
+    }
+    gallery_folder_indices = torch.tensor(
+        [folder_to_index[name_to_folder[name]] for name in index_names],
+        dtype=torch.long,
     )
+    target_folder_indices = torch.tensor(
+        [folder_to_index[name_to_folder[name]] for name in target_names],
+        dtype=torch.long,
+    ).unsqueeze(1)
+    class_labels = gallery_folder_indices[top_indices].eq(target_folder_indices)
 
-    class_recall_at1, class_recall_at3, class_recall_at5 = compute_class_recall(
-        sorted_index_names,
-        target_names,
-        relative_val_dataset.name_to_relpath,
-    )
+    def recall_at(labels_tensor, k):
+        k = min(k, labels_tensor.size(1))
+        return labels_tensor[:, :k].any(dim=1).float().mean().item() * 100
 
-    recall_at1 = (torch.sum(labels[:, :1]) / len(labels)).item() * 100
-    recall_at5 = (torch.sum(labels[:, :5]) / len(labels)).item() * 100
-    recall_at10 = (torch.sum(labels[:, :10]) / len(labels)).item() * 100
-    recall_at50 = (torch.sum(labels[:, :50]) / len(labels)).item() * 100
+    recall_at1 = recall_at(labels, 1)
+    recall_at5 = recall_at(labels, 5)
+    recall_at10 = recall_at(labels, 10)
+    recall_at50 = recall_at(labels, 50)
+    class_recall_at1 = recall_at(class_labels, 1)
+    class_recall_at3 = recall_at(class_labels, 3)
+    class_recall_at5 = recall_at(class_labels, 5)
 
     metrics = (
         recall_at1,
@@ -625,6 +682,11 @@ def _compute_oacirr_metrics_from_predictions(
     )
 
     if save_results:
+        # Full rankings are intentionally materialized only when explicitly
+        # requested. Normal training/validation never needs this large object.
+        sorted_indices = torch.argsort(pred_sim, dim=-1, descending=True).cpu()
+        sorted_index_names = np.array(index_names)[sorted_indices]
+        sorted_index_names = sorted_index_names[:, :-1]
         return (
             *metrics,
             reference_names,
@@ -847,27 +909,51 @@ def generate_oacirr_val_predictions_latent(
                     candidate_count,
                     dim=1,
                 ).indices
-                raw_candidate_indices = candidate_indices.to(index_raw_embeds.device)
-                target_candidate_raw = index_raw_embeds[raw_candidate_indices]
                 composition_candidate_logits = torch.gather(
                     global_composition,
                     dim=1,
                     index=candidate_indices,
                 )
-                rerank_output = latent_model.inference_core_matcher_candidates(
-                    reference_image_embeds_raw=reference_raw_embeds,
-                    target_candidate_embeds_raw=target_candidate_raw,
-                    composition_candidate_logits=composition_candidate_logits,
-                    modification_text=captions,
-                    reference_bbox=reference_bbox,
-                    return_parts=True,
+                reranked_chunks = []
+                fusion_scalar_chunks = []
+                query_chunk_size = max(
+                    int(getattr(latent_model, "core_matcher_query_chunk_size", 8)),
+                    1,
                 )
+                for query_start in range(0, len(captions), query_chunk_size):
+                    query_end = min(query_start + query_chunk_size, len(captions))
+                    query_candidate_indices = candidate_indices[query_start:query_end]
+                    target_candidate_raw = index_raw_embeds[
+                        query_candidate_indices.to(index_raw_embeds.device)
+                    ]
+                    target_candidate_features = index_features[
+                        query_candidate_indices.to(index_features.device)
+                    ]
+                    rerank_output = latent_model.inference_core_matcher_candidates(
+                        reference_image_embeds_raw=reference_raw_embeds[query_start:query_end],
+                        target_candidate_embeds_raw=target_candidate_raw,
+                        target_candidate_features=target_candidate_features,
+                        composition_candidate_logits=composition_candidate_logits[query_start:query_end],
+                        modification_text=captions[query_start:query_end],
+                        reference_bbox=reference_bbox[query_start:query_end],
+                        return_parts=True,
+                    )
+                    reranked_chunks.append(rerank_output["sim_final"].detach().cpu())
+                    fusion_scalar_chunks.append(
+                        rerank_output["fusion_scalar"].detach().cpu()
+                    )
+                    del target_candidate_raw, target_candidate_features, rerank_output
+
+                reranked_logits = torch.cat(reranked_chunks, dim=0)
                 batch_distance = latent_model.merge_topk_ranking(
                     global_composition,
                     candidate_indices,
-                    rerank_output["sim_final"].detach().cpu(),
+                    reranked_logits,
                 )
-                activation_scalar_for_batch = rerank_output["fusion_scalar"]
+                activation_scalar_for_batch = torch.cat(
+                    fusion_scalar_chunks,
+                    dim=0,
+                )
             else:
                 batch_distance = torch.cat(sim_chunks, dim=1)
             distance.append(batch_distance)

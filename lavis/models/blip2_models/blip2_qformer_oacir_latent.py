@@ -107,41 +107,6 @@ class CoreReferenceRegionEncoder(nn.Module):
         return region_tokens, pooled_feature, activation_weights
 
 
-class CoreAdaptiveFusion(nn.Module):
-    """CORE AVTI: channel-wise visual/text gates plus a dynamic scalar."""
-
-    def __init__(self, embed_dim: int, dropout: float = 0.5):
-        super().__init__()
-
-        def gate():
-            return nn.Sequential(
-                nn.Linear(2 * embed_dim, embed_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(embed_dim, embed_dim),
-                nn.Sigmoid(),
-            )
-
-        self.visual_gate = gate()
-        self.text_gate = gate()
-        self.dynamic_scalar = nn.Sequential(
-            nn.Linear(2 * embed_dim, embed_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, reference_features, text_features):
-        text_features = text_features.to(dtype=reference_features.dtype)
-        combined = torch.cat([reference_features, text_features], dim=-1)
-        visual = self.visual_gate(combined) * reference_features
-        text = self.text_gate(combined) * text_features
-        alpha = self.dynamic_scalar(torch.cat([visual, text], dim=-1))
-        composed = alpha * visual + (1.0 - alpha) * text
-        return F.normalize(composed, dim=-1), alpha
-
-
 class ContextualReasoningModule(nn.Module):
     """
     AdaFocal CRM used by CAAM to predict the reference-box attention bias scale.
@@ -224,6 +189,7 @@ class Blip2QformerOacirLatent(Blip2Base):
             num_query_token, self.visual_encoder.num_features, cross_attention_freq
         )
         self.Qformer.resize_token_embeddings(len(self.tokenizer))
+        self.Qformer.config.gradient_checkpointing = True
 
         self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
         self.text_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
@@ -276,7 +242,17 @@ class Blip2QformerOacirLatent(Blip2Base):
             embed_dim=embed_dim,
             num_regions=16,
         )
-        self.core_adaptive_fusion = CoreAdaptiveFusion(embed_dim=embed_dim)
+        self.num_core_query_token = self.core_reference_encoder.num_regions
+        self.core_query_tokens = nn.Parameter(
+            torch.zeros(1, self.num_core_query_token, qformer_hidden_dim)
+        )
+        self.core_query_tokens.data.normal_(
+            mean=0.0,
+            std=self.Qformer.config.initializer_range,
+        )
+        self.core_region_norm = nn.LayerNorm(vision_width)
+        self.core_target_region_proj = nn.Linear(embed_dim, embed_dim)
+        self._init_identity_linear(self.core_target_region_proj)
 
         self.temp = nn.Parameter(0.07 * torch.ones([]))
         self.global_token_weights = nn.Parameter(torch.ones(num_query_token))
@@ -528,6 +504,7 @@ class Blip2QformerOacirLatent(Blip2Base):
             attention_mask=pre_fusion_atts,
             encoder_hidden_states=reference_image_embeds,
             encoder_attention_mask=reference_image_atts,
+            use_cache=False,
             return_dict=True,
         )
         pre_fusion_features = pre_fusion_output.last_hidden_state[
@@ -585,6 +562,7 @@ class Blip2QformerOacirLatent(Blip2Base):
             attention_mask=fusion_atts,
             encoder_hidden_states=reference_image_embeds,
             encoder_attention_mask=reference_image_atts,
+            use_cache=False,
             return_dict=True,
             attention_bias=attention_bias,
         )
@@ -607,6 +585,7 @@ class Blip2QformerOacirLatent(Blip2Base):
         text_output = self.Qformer.bert(
             text_tokens.input_ids,
             attention_mask=text_tokens.attention_mask,
+            use_cache=False,
             return_dict=True,
         )
         return F.normalize(self.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1)
@@ -624,7 +603,7 @@ class Blip2QformerOacirLatent(Blip2Base):
             query_embeds=query_tokens,
             encoder_hidden_states=target_image_embeds,
             encoder_attention_mask=target_image_atts,
-            use_cache=True,
+            use_cache=False,
             return_dict=True,
         )
 
@@ -730,7 +709,7 @@ class Blip2QformerOacirLatent(Blip2Base):
         self,
         reference_image_embeds_raw,
         reference_bbox,
-        text_features,
+        modification_text,
     ):
         reference_tokens = self._project_raw_patch_tokens(reference_image_embeds_raw)
         anchor_mask = self._build_anchor_mask(
@@ -746,9 +725,23 @@ class Blip2QformerOacirLatent(Blip2Base):
                 bbox_floor=self.core_matcher_bbox_floor,
             )
         )
-        composed_feature, fusion_scalar = self.core_adaptive_fusion(
-            reference_feature,
-            text_features,
+
+        # Reuse the learned semantic-region weights on the original ViT-width
+        # tokens. Q-Former cross-attention was pretrained for this encoder width,
+        # whereas the identity branch deliberately remains in the 256-D metric
+        # space above.
+        reference_image_embeds = self.ln_vision(
+            reference_image_embeds_raw.to(dtype=self.ln_vision.weight.dtype)
+        )
+        visual_region_tokens = torch.einsum(
+            "bkn,bnd->bkd",
+            reference_attention.to(dtype=reference_image_embeds.dtype),
+            reference_image_embeds[:, 1:, :],
+        )
+        visual_region_tokens = self.core_region_norm(visual_region_tokens)
+        composed_feature, fusion_scalar = self._compute_core_qformer_fusion(
+            visual_region_tokens,
+            modification_text,
         )
 
         num_target_patches = reference_tokens.size(1)
@@ -770,12 +763,67 @@ class Blip2QformerOacirLatent(Blip2Base):
             "region_sizes": region_sizes,
         }
 
+    def _compute_core_qformer_fusion(
+        self,
+        visual_region_tokens,
+        modification_text,
+    ):
+        """Jointly encode reference-region tokens and modification text."""
+        device = visual_region_tokens.device
+        batch_size = visual_region_tokens.size(0)
+        text_tokens = self._tokenize_text(modification_text, device)
+        query_tokens = self.core_query_tokens.expand(batch_size, -1, -1)
+        query_atts = torch.ones(
+            query_tokens.size()[:-1],
+            dtype=torch.long,
+            device=device,
+        )
+        fusion_atts = torch.cat(
+            [query_atts, text_tokens.attention_mask],
+            dim=1,
+        )
+        region_atts = torch.ones(
+            visual_region_tokens.size()[:-1],
+            dtype=torch.long,
+            device=device,
+        )
+
+        fusion_output = self.Qformer.bert(
+            text_tokens.input_ids,
+            query_embeds=query_tokens,
+            attention_mask=fusion_atts,
+            encoder_hidden_states=visual_region_tokens,
+            encoder_attention_mask=region_atts,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden_states = fusion_output.last_hidden_state
+        composed_feature = F.normalize(
+            self.text_proj(hidden_states[:, self.num_core_query_token, :]),
+            dim=-1,
+        )
+
+        # Retain a scalar diagnostic without reintroducing an external gate.
+        query_features = F.normalize(
+            self.vision_proj(hidden_states[:, : self.num_core_query_token, :]),
+            dim=-1,
+        )
+        fusion_scalar = (
+            torch.einsum("bkd,bd->bk", query_features, composed_feature)
+            .mean(dim=1, keepdim=True)
+            .add(1.0)
+            .mul(0.5)
+            .clamp(0.0, 1.0)
+        )
+        return composed_feature, fusion_scalar
+
     def _compute_core_matcher_candidate_scores(
         self,
         reference_image_embeds_raw,
         target_image_embeds_raw,
+        target_qformer_features,
         reference_bbox,
-        text_features,
+        modification_text,
         candidate_indices=None,
         return_heatmap=False,
     ):
@@ -788,7 +836,7 @@ class Blip2QformerOacirLatent(Blip2Base):
         core_reference = self._compute_core_reference_features(
             reference_image_embeds_raw,
             reference_bbox,
-            text_features,
+            modification_text,
         )
         if target_image_embeds_raw.dim() == 3:
             if candidate_indices is None:
@@ -808,14 +856,22 @@ class Blip2QformerOacirLatent(Blip2Base):
         else:
             raise ValueError("target_image_embeds_raw must be [T,N,D] or [B,C,N,D]")
 
-        output_keys = (
+        matching_output_keys = (
+            "score_id",
+            "score_comp",
+            "score_background",
+            "region_features",
+            "cycle_ratio",
+            "entropy",
+        )
+        collected_keys = (
             "score_id",
             "score_comp",
             "score_background",
             "cycle_ratio",
             "entropy",
         )
-        collected = {key: [] for key in output_keys}
+        collected = {key: [] for key in collected_keys}
         heatmaps = []
         query_chunk_size = max(int(self.core_matcher_query_chunk_size), 1)
 
@@ -826,6 +882,7 @@ class Blip2QformerOacirLatent(Blip2Base):
                 reference_regions = core_reference["region_tokens"][start:end]
                 composed_features = core_reference["composed_feature"][start:end]
                 region_sizes = core_reference["region_sizes"][start:end]
+                candidate_qformer_features = target_qformer_features[current_indices]
 
                 if self.training and torch.is_grad_enabled():
                     def checkpointed_matching(
@@ -848,7 +905,7 @@ class Blip2QformerOacirLatent(Blip2Base):
                             text_weight=self.core_matcher_text_weight,
                             return_heatmap=False,
                         )
-                        return tuple(matched[key] for key in output_keys)
+                        return tuple(matched[key] for key in matching_output_keys)
 
                     checkpoint_outputs = checkpoint(
                         checkpointed_matching,
@@ -860,7 +917,7 @@ class Blip2QformerOacirLatent(Blip2Base):
                         use_reentrant=False,
                         preserve_rng_state=False,
                     )
-                    chunk_outputs = dict(zip(output_keys, checkpoint_outputs))
+                    chunk_outputs = dict(zip(matching_output_keys, checkpoint_outputs))
                 else:
                     candidate_tokens = target_tokens[current_indices]
                     chunk_outputs = compute_bidirectional_region_scores(
@@ -890,6 +947,10 @@ class Blip2QformerOacirLatent(Blip2Base):
                     raw_shape[-2] - 1,
                     -1,
                 )
+                candidate_qformer_features = target_qformer_features[start:end].to(
+                    reference_image_embeds_raw.device,
+                    non_blocking=True,
+                )
                 chunk_outputs = compute_bidirectional_region_scores(
                     core_reference["region_tokens"][start:end],
                     candidate_tokens,
@@ -902,7 +963,13 @@ class Blip2QformerOacirLatent(Blip2Base):
                     text_weight=self.core_matcher_text_weight,
                     return_heatmap=return_heatmap,
                 )
-            for key in output_keys:
+
+            chunk_outputs["score_comp"] = self._compute_core_target_composition_scores(
+                composed_features=core_reference["composed_feature"][start:end],
+                target_region_features=chunk_outputs["region_features"],
+                target_qformer_features=candidate_qformer_features,
+            )
+            for key in collected_keys:
                 collected[key].append(chunk_outputs[key])
             if return_heatmap:
                 heatmaps.append(chunk_outputs["target_attention"])
@@ -917,6 +984,66 @@ class Blip2QformerOacirLatent(Blip2Base):
         if return_heatmap:
             outputs["target_attention"] = torch.cat(heatmaps, dim=0)
         return outputs
+
+    def _compute_core_target_composition_scores(
+        self,
+        composed_features,
+        target_region_features,
+        target_qformer_features,
+    ):
+        """Align latent target regions with cached target Q-Former tokens."""
+        target_qformer_features = F.normalize(
+            target_qformer_features.to(
+                device=composed_features.device,
+                dtype=composed_features.dtype,
+                non_blocking=True,
+            ),
+            dim=-1,
+        )
+        if target_qformer_features.dim() == 3:
+            return torch.einsum(
+                "bd,bcd->bc",
+                composed_features,
+                target_qformer_features,
+            )
+        if target_qformer_features.dim() != 4:
+            raise ValueError(
+                "target_qformer_features must have shape [B,C,D] or [B,C,Q,D]"
+            )
+
+        region_selector = F.normalize(
+            self.core_target_region_proj(target_region_features),
+            dim=-1,
+        )
+        region_selector_logits = torch.einsum(
+            "bcd,bcqd->bcq",
+            region_selector,
+            target_qformer_features,
+        )
+        composition_selector_logits = torch.einsum(
+            "bd,bcqd->bcq",
+            composed_features,
+            target_qformer_features,
+        )
+        selector_logits = 0.5 * (
+            region_selector_logits + composition_selector_logits
+        )
+        selector_temperature = max(float(self.region_temperature), 1e-4)
+        selector_weights = F.softmax(
+            selector_logits / selector_temperature,
+            dim=-1,
+        )
+        target_region_qformer = torch.einsum(
+            "bcq,bcqd->bcd",
+            selector_weights,
+            target_qformer_features,
+        )
+        target_region_qformer = F.normalize(target_region_qformer, dim=-1)
+        return torch.einsum(
+            "bd,bcd->bc",
+            composed_features,
+            target_region_qformer,
+        )
 
     def fuse_core_matcher_scores(self, composition_logits, core_matcher_logits, topk=None):
         """Apply CORE-Matcher strictly inside the backbone's global Top-K."""
@@ -1324,7 +1451,6 @@ class Blip2QformerOacirLatent(Blip2Base):
             modification_text,
             reference_bbox,
         )
-        text_features = self._compute_text_features(modification_text, reference_embeds.device)
         target_features = self._compute_target_features_from_embeds(target_embeds)
 
         sim_comp = self._compute_composition_scores(fusion_features, target_features)
@@ -1375,8 +1501,9 @@ class Blip2QformerOacirLatent(Blip2Base):
                 core_scores = self._compute_core_matcher_candidate_scores(
                     reference_raw,
                     target_raw,
+                    target_features,
                     reference_bbox,
-                    text_features,
+                    modification_text,
                     candidate_indices,
                     return_heatmap=False,
                 )
@@ -1445,6 +1572,10 @@ class Blip2QformerOacirLatent(Blip2Base):
                 return loss_dict
 
             if self.latent_matcher == "bicm":
+                text_features = self._compute_text_features(
+                    modification_text,
+                    reference_embeds.device,
+                )
                 bicm_scores = self._compute_bicm_scores(
                     reference_raw,
                     target_raw,
@@ -1469,6 +1600,10 @@ class Blip2QformerOacirLatent(Blip2Base):
                 loss_dict["loss_ent"] = positive_entropy.mean()
                 return loss_dict
 
+            text_features = self._compute_text_features(
+                modification_text,
+                reference_embeds.device,
+            )
             candidate_indices = self._build_ot_candidate_indices(sim_comp_logits)
             if candidate_indices is None or self.return_aux_losses:
                 instance_output = self._compute_instance_scores(
@@ -1598,6 +1733,7 @@ class Blip2QformerOacirLatent(Blip2Base):
         self,
         reference_image_embeds_raw,
         target_candidate_embeds_raw,
+        target_candidate_features,
         composition_candidate_logits,
         modification_text,
         reference_bbox,
@@ -1613,12 +1749,12 @@ class Blip2QformerOacirLatent(Blip2Base):
             device,
             non_blocking=True,
         )
-        text_features = self._compute_text_features(modification_text, device)
         core_scores = self._compute_core_matcher_candidate_scores(
             reference_image_embeds_raw,
             target_candidate_embeds_raw,
+            target_candidate_features,
             reference_bbox,
-            text_features,
+            modification_text,
             candidate_indices=None,
             return_heatmap=return_heatmap,
         )
@@ -1674,7 +1810,6 @@ class Blip2QformerOacirLatent(Blip2Base):
             modification_text,
             reference_bbox,
         )
-        text_features = self._compute_text_features(modification_text, device)
 
         sim_comp = self._compute_composition_scores(fusion_features, target_features)
         sim_comp_logits = sim_comp / self.temp
@@ -1688,8 +1823,9 @@ class Blip2QformerOacirLatent(Blip2Base):
             core_scores = self._compute_core_matcher_candidate_scores(
                 reference_image_embeds_raw,
                 target_image_embeds_raw,
+                target_features,
                 reference_bbox,
-                text_features,
+                modification_text,
                 candidate_indices,
                 return_heatmap=return_heatmap,
             )
@@ -1734,6 +1870,7 @@ class Blip2QformerOacirLatent(Blip2Base):
 
             return sim_final_logits
 
+        text_features = self._compute_text_features(modification_text, device)
         if self.latent_matcher == "bicm":
             bicm_scores = self._compute_bicm_scores(
                 reference_image_embeds_raw,
@@ -1819,5 +1956,13 @@ class Blip2QformerOacirLatent(Blip2Base):
             num_probe_token=num_probe_token,
         )
         model.load_checkpoint_from_config(cfg)
+        with torch.no_grad():
+            num_tokens = min(
+                model.num_core_query_token,
+                model.query_tokens.size(1),
+            )
+            model.core_query_tokens[:, :num_tokens].copy_(
+                model.query_tokens[:, :num_tokens]
+            )
 
         return model

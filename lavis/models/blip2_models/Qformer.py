@@ -550,7 +550,11 @@ class BertEncoder(nn.Module):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(
-                            *inputs, past_key_value, output_attentions, query_length
+                            *inputs[:5],
+                            past_key_value,
+                            output_attentions,
+                            query_length,
+                            attention_bias=inputs[5],
                         )
 
                     return custom_forward
@@ -562,6 +566,9 @@ class BertEncoder(nn.Module):
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
+                    attention_bias,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
                 )
             else:
                 layer_outputs = layer_module(

@@ -1,4 +1,5 @@
 import os
+import gc
 import json
 import torch
 import random
@@ -211,7 +212,11 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
         )
 
     ### Validation Datasets
-    val_variants = ['Fashion'] if train_variant == 'Union' else [train_variant]
+    val_variants = (
+        ['Fashion', 'Car', 'Product', 'Landmark']
+        if train_variant == 'Union'
+        else [train_variant]
+    )
     val_datasets = {}
     validation_log_frame = {}
 
@@ -252,7 +257,7 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             object_categories = batch_data[7] if len(batch_data) > 7 else None
             images_in_batch = reference_images.size(0)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             blip_model.train()
 
             with torch.cuda.amp.autocast():
@@ -353,6 +358,10 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
                         latent_gallery_chunk_size=kwargs.get("latent_gallery_chunk_size", 1024),
                         eval_batch_size=kwargs.get("val_query_batch_size", 16),
                     )
+                    del val_index_features, val_index_raw_embeds, val_index_names
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 else:
                     val_index_features, val_index_names = extract_index_blip_features(classic_val_dataset, blip_model, save_memory)
                     results = compute_oacirr_val_metrics(

@@ -1,4 +1,5 @@
 import os
+import inspect
 import json
 import random
 import numpy as np
@@ -472,7 +473,11 @@ class OACIRRFeatureDataset(OACIRRDataset):
         )
 
         print(f"Loading precomputed visual embeddings from: {cache_path}")
-        cache = torch.load(cache_path, map_location="cpu")
+        load_kwargs = {"map_location": "cpu"}
+        if "mmap" in inspect.signature(torch.load).parameters:
+            load_kwargs["mmap"] = True
+            print("Using memory-mapped train visual embeddings")
+        cache = torch.load(cache_path, **load_kwargs)
 
         self.cache_names = cache["names"]
         self.cache_embeds = cache["embeds"]

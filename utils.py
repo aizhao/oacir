@@ -411,16 +411,31 @@ def set_train_bar_description_dict(train_bar, epoch: int, num_epochs: int, train
         :param train_running_results: logging training dict
     """ 
     images_in_epoch = train_running_results['images_in_epoch']
-
-    bar_content = ''
-
-    for key in train_running_results:
-        if key != 'images_in_epoch':
-            bar_content += f'{key}: {train_running_results[key] / images_in_epoch:.3f}, '
-
-    train_bar.set_description(
-        desc=f"[{epoch}/{num_epochs}] {bar_content}"
+    preferred_losses = (
+        ('loss_comp', 'comp'),
+        ('loss_align', 'align'),
+        ('loss_core_matcher', 'core'),
+        ('loss_core_comp', 'c_comp'),
+        ('loss_core_id', 'c_id'),
     )
+    postfix = {
+        label: f'{train_running_results[key] / images_in_epoch:.3f}'
+        for key, label in preferred_losses
+        if key in train_running_results
+    }
+
+    if not postfix:
+        for key in train_running_results:
+            if key == 'images_in_epoch':
+                continue
+            postfix[key.removeprefix('loss_')] = (
+                f'{train_running_results[key] / images_in_epoch:.3f}'
+            )
+            if len(postfix) == 4:
+                break
+
+    train_bar.set_description_str(f'[{epoch}/{num_epochs}]')
+    train_bar.set_postfix(postfix, refresh=False)
 
 
 def save_model(name: str, cur_epoch: int, model_to_save: nn.Module, training_path: Path):
