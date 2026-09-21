@@ -412,11 +412,11 @@ def set_train_bar_description_dict(train_bar, epoch: int, num_epochs: int, train
     """ 
     images_in_epoch = train_running_results['images_in_epoch']
     preferred_losses = (
-        ('loss_comp', 'comp'),
         ('loss_align', 'align'),
         ('loss_core_matcher', 'core'),
         ('loss_core_comp', 'c_comp'),
         ('loss_core_id', 'c_id'),
+        ('loss_core_region', 'region'),
     )
     postfix = {
         label: f'{train_running_results[key] / images_in_epoch:.3f}'

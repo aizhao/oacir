@@ -21,7 +21,6 @@ from statistics import mean, geometric_mean, harmonic_mean
 
 from data_utils import (
     squarepad_transform, targetpad_transform, OACIRRFeatureDataset,
-    OACIRRTypedBatchSampler,
     OACIRRDataset, CIRRDataset, FashionIQDataset
 )
 from utils import (
@@ -90,21 +89,6 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
     print("BLIP model loaded.", flush=True)
     if hasattr(blip_model, "set_latent_config"):
         blip_model.set_latent_config(
-            lambda_ins=kwargs.get("lambda_ins", 0.2),
-            temp_ins=kwargs.get("temp_ins", 0.07),
-            latent_matcher=kwargs.get("latent_matcher", "ot"),
-            latent_chunk_size=kwargs.get("latent_chunk_size", 256),
-            ot_sinkhorn_iters=kwargs.get("ot_sinkhorn_iters", 20),
-            ot_temperature=kwargs.get("ot_temperature", 0.07),
-            ot_vote_temperature=kwargs.get("ot_vote_temperature", 0.07),
-            ot_text_weight=kwargs.get("ot_text_weight", 0.1),
-            ot_bbox_gamma=kwargs.get("ot_bbox_gamma", 1.0),
-            ot_topk=kwargs.get("ot_topk", 50),
-            bicm_temp=kwargs.get("bicm_temp", 0.07),
-            bicm_lambda_id=kwargs.get("bicm_lambda_id", 0.5),
-            bicm_lambda_ent=kwargs.get("bicm_lambda_ent", 0.01),
-            bicm_mask_floor=kwargs.get("bicm_mask_floor", 0.1),
-            bicm_fusion_weight=kwargs.get("bicm_fusion_weight", 0.1),
             core_matcher_temp=kwargs.get("core_matcher_temp", 0.07),
             core_matcher_lambda_id=kwargs.get("core_matcher_lambda_id", 0.5),
             core_matcher_fusion_weight=kwargs.get("core_matcher_fusion_weight", 0.02),
@@ -119,13 +103,6 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             region_spatial_kernel=kwargs.get("region_spatial_kernel", 3),
             region_spatial_weight=kwargs.get("region_spatial_weight", 0.15),
             region_temperature=kwargs.get("region_temperature", 0.07),
-            spatial_variance_margin=kwargs.get("spatial_variance_margin", 0.08),
-            typed_comp_gamma=kwargs.get("typed_comp_gamma", 0.5),
-            global_margin=kwargs.get("global_margin", 0.1),
-            global_hard_weight=kwargs.get("global_hard_weight", 1.0),
-            global_hard_topk=kwargs.get("global_hard_topk", 16),
-            use_typed_contrastive=kwargs.get("typed_contrastive", False),
-            return_aux_losses=kwargs.get("return_aux_losses", False),
         )
     if blip_model_weight:
         blip_model_checkpoint = torch.load(blip_model_weight, map_location=device)
@@ -186,30 +163,10 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             bounding_box_crop=kwargs.get("bounding_box_crop", False),
         )
 
-    use_typed_sampler = (
-        kwargs.get("typed_contrastive", False)
-        and hasattr(blip_model, "inference_with_latent_matching")
+    relative_train_loader = DataLoader(
+        dataset=relative_train_dataset, batch_size=batch_size, num_workers=kwargs['num_workers'],
+        pin_memory=False, collate_fn=custom_collate_fn, drop_last=True, shuffle=True
     )
-    if use_typed_sampler:
-        typed_batch_sampler = OACIRRTypedBatchSampler(
-            relative_train_dataset,
-            batch_size=batch_size,
-            drop_last=True,
-            seed=kwargs.get("seed") or 0,
-            typed_companion_fraction=kwargs.get("typed_companion_fraction", 0.25),
-        )
-        relative_train_loader = DataLoader(
-            dataset=relative_train_dataset,
-            batch_sampler=typed_batch_sampler,
-            num_workers=kwargs["num_workers"],
-            pin_memory=False,
-            collate_fn=custom_collate_fn,
-        )
-    else:
-        relative_train_loader = DataLoader(
-            dataset=relative_train_dataset, batch_size=batch_size, num_workers=kwargs['num_workers'],
-            pin_memory=False, collate_fn=custom_collate_fn, drop_last=True, shuffle=True
-        )
 
     ### Validation Datasets
     val_variants = (
@@ -253,8 +210,6 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             target_images = batch_data[1].to(device, non_blocking=True)
             modification_texts = [txt_processors["eval"](text) for text in batch_data[4]]
             reference_bboxes = batch_data[5]
-            target_instance_ids = batch_data[6] if len(batch_data) > 6 else None
-            object_categories = batch_data[7] if len(batch_data) > 7 else None
             images_in_batch = reference_images.size(0)
 
             optimizer.zero_grad(set_to_none=True)
@@ -267,8 +222,6 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
                         "target_image_embeds_raw": target_images,
                         "modification_text": modification_texts,
                         "reference_bbox": reference_bboxes if needs_reference_bbox else None,
-                        "target_instance_ids": target_instance_ids,
-                        "object_categories": object_categories,
                     })
                 else:
                     loss_dict = blip_model({
@@ -276,8 +229,6 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
                         "target_image": target_images,
                         "modification_text": modification_texts,
                         "reference_bbox": reference_bboxes if needs_reference_bbox else None,
-                        "target_instance_ids": target_instance_ids,
-                        "object_categories": object_categories,
                     })
 
                 loss = 0.
@@ -325,7 +276,7 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
                         relative_val_dataset, blip_model, val_index_features, val_index_features_bbox,
                         val_index_names, val_index_names_bbox, txt_processors, save_memory=save_memory
                     )
-                elif hasattr(blip_model, "inference_with_latent_matching"):
+                elif hasattr(blip_model, "inference_core_matcher_candidates"):
                     val_feature_cache = kwargs.get("val_feature_cache")
                     if val_feature_cache:
                         cache_path = val_feature_cache.format(
@@ -748,15 +699,6 @@ if __name__ == '__main__':
     parser.add_argument("--learning-rate", default=1e-5, type=float, help="Learning rate")
     parser.add_argument("--batch-size", default=128, type=int, help="Batch size")
     parser.add_argument("--loss-align", default=1.0, type=float, help="Weight of Contrastive Alignment Loss")
-    parser.add_argument("--loss-comp", default=0.0, type=float, help="Weight of Composition Contrastive Loss")
-    parser.add_argument("--loss-global", default=0.0, type=float,
-                        help="Weight of adaptive cosine hard-negative global loss")
-    parser.add_argument("--global-margin", default=0.1, type=float,
-                        help="Margin for hard negatives in adaptive cosine global loss")
-    parser.add_argument("--global-hard-weight", default=1.0, type=float,
-                        help="Weight of the hard-negative term inside adaptive cosine global loss")
-    parser.add_argument("--global-hard-topk", default=16, type=int,
-                        help="Number of AdaFocal-ranked hard negatives used by adaptive cosine global loss")
 
     parser.add_argument("--highlight-training", action='store_true', help="Whether use region highlight strategy during training")
     parser.add_argument("--highlight-inference", action='store_true', help="Whether use region highlight strategy during inference")
@@ -808,22 +750,6 @@ if __name__ == '__main__':
         help="Query batch size for latent validation and Top-K reranking.",
     )
 
-    parser.add_argument("--lambda-ins", default=0.2, type=float,
-                    help="Weight of target-side latent instance score in final logits")
-    parser.add_argument("--temp-ins", default=0.07, type=float,
-                        help="Temperature for target-side latent instance logits")
-    parser.add_argument("--loss-ins", default=0.0, type=float,
-                        help="Weight of auxiliary instance matching loss")
-    parser.add_argument("--loss-ot", default=0.0, type=float,
-                        help="Weight of the full OT latent branch contrastive loss")
-    parser.add_argument("--loss-final", default=0.0, type=float,
-                        help="Weight of the BICM final retrieval loss")
-    parser.add_argument("--loss-id", default=0.0, type=float,
-                        help="Weight of the BICM identity preservation loss")
-    parser.add_argument("--loss-edit", default=0.0, type=float,
-                        help="Weight of the BICM edit direction loss")
-    parser.add_argument("--loss-ent", default=0.0, type=float,
-                        help="Weight of the BICM target attention entropy loss")
     parser.add_argument("--loss-core-matcher", default=0.0, type=float,
                         help="Weight of CORE-Matcher candidate reranking loss")
     parser.add_argument("--loss-core-id", default=0.0, type=float,
@@ -832,32 +758,6 @@ if __name__ == '__main__':
                         help="Weight of CORE region-level composition loss")
     parser.add_argument("--loss-core-region", default=0.0, type=float,
                         help="Weight of CORE foreground/background contrastive loss")
-    parser.add_argument("--latent-chunk-size", default=256, type=int,
-                        help="Chunk size for latent target matching")
-    parser.add_argument("--latent-matcher", default="bicm", choices=["maxsim", "ot", "bicm", "core_matcher"],
-                        help="Latent instance matcher used in the final score")
-    parser.add_argument("--ot-sinkhorn-iters", default=20, type=int,
-                        help="Number of log-domain Sinkhorn iterations for OT latent matching")
-    parser.add_argument("--ot-temperature", default=0.07, type=float,
-                        help="Temperature for OT transport scores")
-    parser.add_argument("--ot-vote-temperature", default=0.07, type=float,
-                        help="Temperature for differentiable soft voting after OT")
-    parser.add_argument("--ot-text-weight", default=0.1, type=float,
-                        help="Initial learnable weight for text-to-target patch prior in OT")
-    parser.add_argument("--ot-bbox-gamma", default=1.0, type=float,
-                        help="Initial learnable bbox prior strength for reference dustbin/voting in OT")
-    parser.add_argument("--ot-topk", default=50, type=int,
-                        help="Number of backbone-ranked candidates used by the OT reranking loss")
-    parser.add_argument("--bicm-temp", default=0.07, type=float,
-                        help="Temperature for BICM final/id/edit logits")
-    parser.add_argument("--bicm-lambda-id", default=0.5, type=float,
-                        help="Identity score weight inside the BICM final score")
-    parser.add_argument("--bicm-lambda-ent", default=0.01, type=float,
-                        help="Attention entropy penalty weight inside the BICM final score")
-    parser.add_argument("--bicm-mask-floor", default=0.1, type=float,
-                        help="Lower bound for text-conditioned preservation mask values")
-    parser.add_argument("--bicm-fusion-weight", default=0.1, type=float,
-                        help="Residual weight for adding BICM logits to backbone composition logits")
     parser.add_argument("--core-matcher-temp", default=0.07, type=float,
                         help="Temperature for CORE-Matcher candidate logits")
     parser.add_argument("--core-matcher-lambda-id", default=0.5, type=float,
@@ -885,28 +785,7 @@ if __name__ == '__main__':
     parser.add_argument("--region-spatial-weight", default=0.15, type=float,
                         help="Distance penalty used to keep the latent region spatially coherent")
     parser.add_argument("--region-temperature", default=0.07, type=float,
-                        help="Temperature used by the positive-region compactness loss")
-    parser.add_argument("--spatial-variance-margin", default=0.08, type=float,
-                        help="Allowed positive-region variance before spatial loss is applied")
-    parser.add_argument("--loss-spatial", default=0.02, type=float,
-                        help="Weight of target-region spatial consistency loss")
-    parser.add_argument("--typed-comp-gamma", default=0.5, type=float,
-                        help="Typed composition term inside global-plus-typed composition loss")
-    parser.add_argument("--typed-companion-fraction", default=0.25, type=float,
-                        help="Fraction of each batch reserved for typed companion samples")
-    parser.add_argument(
-        "--typed-contrastive",
-        action="store_true",
-        help=(
-            "Use instance-paired batches and typed wrong-instance/"
-            "wrong-composition contrastive masks"
-        ),
-    )
-    parser.add_argument(
-        "--return-aux-losses",
-        action="store_true",
-        help="Return auxiliary instance/spatial losses for ablation logging/training",
-    )
+                        help="Temperature for target-region weighting")
     args = parser.parse_args()
 
 
@@ -927,11 +806,6 @@ if __name__ == '__main__':
         "learning_rate": args.learning_rate,
         "batch_size": args.batch_size,
         "loss_align": args.loss_align,
-        "loss_comp": args.loss_comp,
-        "loss_global": args.loss_global,
-        "global_margin": args.global_margin,
-        "global_hard_weight": args.global_hard_weight,
-        "global_hard_topk": args.global_hard_topk,
         "highlight_training": args.highlight_training,
         "highlight_inference": args.highlight_inference,
         "text_entity": args.text_entity,
@@ -949,31 +823,10 @@ if __name__ == '__main__':
         "val_feature_batch_size": args.val_feature_batch_size,
         "latent_gallery_chunk_size": args.latent_gallery_chunk_size,
         "val_query_batch_size": args.val_query_batch_size,
-        "lambda_ins": args.lambda_ins,
-        "temp_ins": args.temp_ins,
-        "loss_ins": args.loss_ins,
-        "loss_ot": args.loss_ot,
-        "loss_final": args.loss_final,
-        "loss_id": args.loss_id,
-        "loss_edit": args.loss_edit,
-        "loss_ent": args.loss_ent,
         "loss_core_matcher": args.loss_core_matcher,
         "loss_core_id": args.loss_core_id,
         "loss_core_comp": args.loss_core_comp,
         "loss_core_region": args.loss_core_region,
-        "latent_chunk_size": args.latent_chunk_size,
-        "latent_matcher": args.latent_matcher,
-        "ot_sinkhorn_iters": args.ot_sinkhorn_iters,
-        "ot_temperature": args.ot_temperature,
-        "ot_vote_temperature": args.ot_vote_temperature,
-        "ot_text_weight": args.ot_text_weight,
-        "ot_bbox_gamma": args.ot_bbox_gamma,
-        "ot_topk": args.ot_topk,
-        "bicm_temp": args.bicm_temp,
-        "bicm_lambda_id": args.bicm_lambda_id,
-        "bicm_lambda_ent": args.bicm_lambda_ent,
-        "bicm_mask_floor": args.bicm_mask_floor,
-        "bicm_fusion_weight": args.bicm_fusion_weight,
         "core_matcher_temp": args.core_matcher_temp,
         "core_matcher_lambda_id": args.core_matcher_lambda_id,
         "core_matcher_fusion_weight": args.core_matcher_fusion_weight,
@@ -988,12 +841,6 @@ if __name__ == '__main__':
         "region_spatial_kernel": args.region_spatial_kernel,
         "region_spatial_weight": args.region_spatial_weight,
         "region_temperature": args.region_temperature,
-        "spatial_variance_margin": args.spatial_variance_margin,
-        "loss_spatial": args.loss_spatial,
-        "typed_comp_gamma": args.typed_comp_gamma,
-        "typed_companion_fraction": args.typed_companion_fraction,
-        "typed_contrastive": args.typed_contrastive,
-        "return_aux_losses": args.return_aux_losses,
     }
 
 
