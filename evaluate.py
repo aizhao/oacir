@@ -903,13 +903,9 @@ def generate_oacirr_val_predictions_latent(
                 target_candidate_raw = index_raw_embeds[
                     query_candidate_indices.to(index_raw_embeds.device)
                 ]
-                target_candidate_features = index_features[
-                    query_candidate_indices.to(index_features.device)
-                ]
                 rerank_output = latent_model.inference_core_matcher_candidates(
                     reference_image_embeds_raw=reference_raw_embeds[query_start:query_end],
                     target_candidate_embeds_raw=target_candidate_raw,
-                    target_candidate_features=target_candidate_features,
                     composition_candidate_logits=composition_candidate_logits[query_start:query_end],
                     modification_text=captions[query_start:query_end],
                     reference_bbox=reference_bbox[query_start:query_end],
@@ -919,7 +915,7 @@ def generate_oacirr_val_predictions_latent(
                 fusion_scalar_chunks.append(
                     rerank_output["fusion_scalar"].detach().cpu()
                 )
-                del target_candidate_raw, target_candidate_features, rerank_output
+                del target_candidate_raw, rerank_output
 
             reranked_logits = torch.cat(reranked_chunks, dim=0)
             batch_distance = latent_model.merge_topk_ranking(
