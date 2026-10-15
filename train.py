@@ -32,7 +32,7 @@ from evaluate import (
     compute_oacirr_val_metrics, compute_oacirr_val_metrics_latent,
     compute_oacirr_bounding_box_val_metrics, compute_cirr_val_metrics,
     compute_fiq_val_metrics, extract_index_blip_features_with_raw,
-    extract_index_blip_features_from_raw_cache
+    extract_index_blip_features_from_raw_cache, load_checkpoint_safely
 )
 
 
@@ -105,9 +105,45 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             region_temperature=kwargs.get("region_temperature", 0.07),
         )
     if blip_model_weight:
-        blip_model_checkpoint = torch.load(blip_model_weight, map_location=device)
-        msg = blip_model.load_state_dict(blip_model_checkpoint[blip_model.__class__.__name__], strict=False)
-        print(f"Missing keys when loading weights: {msg.missing_keys}")
+        load_checkpoint_safely(blip_model, blip_model_weight)
+    identity_model_weight = kwargs.get("identity_model_weight")
+    if identity_model_weight:
+        if not hasattr(blip_model, "identity_reference_encoder"):
+            raise ValueError(
+                "--identity-model-weight requires a model with "
+                "identity_reference_encoder"
+            )
+        identity_checkpoint = torch.load(identity_model_weight, map_location="cpu")
+        state_dicts = [
+            value
+            for value in identity_checkpoint.values()
+            if isinstance(value, dict)
+        ] if isinstance(identity_checkpoint, dict) else []
+        if len(state_dicts) != 1:
+            raise KeyError(
+                "Expected exactly one state dict in identity checkpoint, got "
+                f"{len(state_dicts)}"
+            )
+        prefix = "core_reference_encoder."
+        identity_state = {
+            key[len(prefix):]: value
+            for key, value in state_dicts[0].items()
+            if key.startswith(prefix)
+        }
+        if not identity_state:
+            raise KeyError(
+                f"No '{prefix}' weights found in {identity_model_weight}"
+            )
+        identity_msg = blip_model.identity_reference_encoder.load_state_dict(
+            identity_state,
+            strict=True,
+        )
+        print(
+            "Loaded identity encoder weights: "
+            f"{identity_model_weight}; {identity_msg}"
+        )
+        del identity_checkpoint, state_dicts, identity_state
+        gc.collect()
 
     # Setup Image Preprocess Transforms
     input_dim = 224
@@ -196,6 +232,8 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
     scaler = torch.cuda.amp.GradScaler()
 
     best_arithmetic = 0
+    best_identity_at1 = 0
+    best_primary3 = 0
     training_log_frame = pd.DataFrame()
 
     # Training Loop
@@ -264,6 +302,8 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
 
             # Iterate over validation subsets
             avg_arithmetics = []
+            avg_identity_at1 = []
+            avg_primary3 = []
 
             for variant in val_variants:
                 print(f"--- Validating on OACIRR [{variant}] ---")
@@ -338,6 +378,14 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
 
                 print(json.dumps(results_dict, indent=4))
                 avg_arithmetics.append(results_dict['arithmetic_mean'])
+                avg_identity_at1.append(results_dict['R_ID@1'])
+                avg_primary3.append(
+                    mean([
+                        results_dict['R_ID@1'],
+                        results_dict['R@1'],
+                        results_dict['R@5'],
+                    ])
+                )
 
                 # Validation CSV Logging
                 log_dict = {'epoch': epoch, **results_dict}
@@ -346,11 +394,30 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
 
             # Checkpoint Saving
             overall_arithmetic = mean(avg_arithmetics)
+            overall_identity_at1 = mean(avg_identity_at1)
+            overall_primary3 = mean(avg_primary3)
 
             if save_training:
-                if save_best and overall_arithmetic > best_arithmetic:
-                    best_arithmetic = overall_arithmetic
-                    save_model('adafocal_finetune_best', epoch, blip_model, training_path)
+                if save_best:
+                    if overall_arithmetic > best_arithmetic:
+                        best_arithmetic = overall_arithmetic
+                        save_model('adafocal_finetune_best', epoch, blip_model, training_path)
+                    if overall_identity_at1 > best_identity_at1:
+                        best_identity_at1 = overall_identity_at1
+                        save_model(
+                            'adafocal_finetune_best_identity',
+                            epoch,
+                            blip_model,
+                            training_path,
+                        )
+                    if overall_primary3 > best_primary3:
+                        best_primary3 = overall_primary3
+                        save_model(
+                            'adafocal_finetune_best_primary3',
+                            epoch,
+                            blip_model,
+                            training_path,
+                        )
                 elif not save_best:
                     if train_variant == 'Union' and (epoch >= 20) and (epoch % 2 == 0):
                         save_model(f'adafocal_finetune_union_epoch_{epoch}', epoch, blip_model, training_path)
@@ -689,6 +756,12 @@ if __name__ == '__main__':
     parser.add_argument("--data-root", type=str, default="./Datasets/OACIRR", help="Root directory of the dataset")
     parser.add_argument("--blip-model-name", type=str, default="oacir_adafocal", help="Model registry name")
     parser.add_argument("--blip-model-weight", type=str, default="", help="Path to pre-trained model weight")
+    parser.add_argument(
+        "--identity-model-weight",
+        type=str,
+        default="",
+        help="Optional latent checkpoint used to initialize the dedicated identity encoder",
+    )
 
     parser.add_argument("--vit-backbone", type=str, default="pretrain", help="pretrain for Vit-G, pretrain_vitL for ViT-L")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
@@ -798,6 +871,7 @@ if __name__ == '__main__':
         "data_root": args.data_root,
         "blip_model_name": args.blip_model_name,
         "blip_model_weight": args.blip_model_weight,
+        "identity_model_weight": args.identity_model_weight,
         "vit_backbone": args.vit_backbone,
         "target_ratio": args.target_ratio,
         "transform": args.transform,

@@ -119,6 +119,7 @@ def compute_bidirectional_region_scores(
     target_candidate_tokens,
     composed_features,
     region_sizes,
+    identity_reference_region_tokens=None,
     spatial_kernel_size: int = 3,
     spatial_weight: float = 0.15,
     region_temperature: float = 0.07,
@@ -129,10 +130,12 @@ def compute_bidirectional_region_scores(
     """Matcher-style bidirectional discovery over per-query target candidates.
 
     Args:
-        reference_region_tokens: [B, R, D] CORE semantic region tokens.
+        reference_region_tokens: [B, R, D] composition/discovery region tokens.
         target_candidate_tokens: [B, C, N, D] target patch tokens.
         composed_features: [B, D] CORE visual-text composed representation.
         region_sizes: [B] adaptive number of target patches to retain.
+        identity_reference_region_tokens: optional [B, R_id, D] identity-only
+            reference tokens. When omitted, reference_region_tokens are reused.
 
     Returns:
         A dictionary containing identity/composition scores and the discovered
@@ -148,6 +151,13 @@ def compute_bidirectional_region_scores(
         raise ValueError("region_temperature must be positive")
 
     reference_region_tokens = F.normalize(reference_region_tokens, dim=-1)
+    if identity_reference_region_tokens is None:
+        identity_reference_region_tokens = reference_region_tokens
+    else:
+        identity_reference_region_tokens = F.normalize(
+            identity_reference_region_tokens,
+            dim=-1,
+        )
     target_candidate_tokens = F.normalize(target_candidate_tokens, dim=-1)
     composed_features = F.normalize(composed_features, dim=-1)
 
@@ -241,16 +251,44 @@ def compute_bidirectional_region_scores(
     )
     region_features = F.normalize(region_features, dim=-1)
 
+    # Identity can use a dedicated reference encoder while the box-query
+    # tokens continue to drive target-region discovery and composition.
+    if identity_reference_region_tokens is reference_region_tokens:
+        identity_similarities = similarities
+    else:
+        identity_similarities = torch.einsum(
+            "brd,bcnd->bcrn",
+            identity_reference_region_tokens,
+            target_candidate_tokens,
+        )
+    identity_forward_indices = identity_similarities.max(dim=-1).indices
+    identity_reverse_values, identity_reverse_indices = (
+        identity_similarities.max(dim=-2)
+    )
+    identity_roundtrip_indices = torch.gather(
+        identity_forward_indices,
+        dim=2,
+        index=identity_reverse_indices,
+    )
+    identity_cycle_mask = identity_roundtrip_indices.eq(target_indices)
+
     # Bidirectional Chamfer provides coverage (reference -> region) and purity
     # (region -> reference); cycle-consistent matches add reliability.
-    region_similarities = similarities.masked_fill(
+    region_similarities = identity_similarities.masked_fill(
         ~selected_mask.unsqueeze(2),
         min_value,
     )
     coverage = region_similarities.max(dim=-1).values.mean(dim=-1)
-    purity = (region_weights * reverse_values).sum(dim=-1)
-    cycle_values = (reverse_values * cycle_mask.to(reverse_values.dtype)).sum(dim=-1)
-    cycle_count = cycle_mask.sum(dim=-1).clamp_min(1).to(reverse_values.dtype)
+    purity = (region_weights * identity_reverse_values).sum(dim=-1)
+    cycle_values = (
+        identity_reverse_values
+        * identity_cycle_mask.to(identity_reverse_values.dtype)
+    ).sum(dim=-1)
+    cycle_count = (
+        identity_cycle_mask.sum(dim=-1)
+        .clamp_min(1)
+        .to(identity_reverse_values.dtype)
+    )
     cycle_similarity = cycle_values / cycle_count
     identity_scores = (
         coverage + purity + float(cycle_weight) * cycle_similarity

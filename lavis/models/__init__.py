@@ -44,6 +44,9 @@ from lavis.models.blip2_models.blip2_qformer_oacir_baseline import Blip2QformerO
 from lavis.models.blip2_models.blip2_qformer_oacir_adafocal import Blip2QformerOacirAdaFocal
 from lavis.models.blip2_models.blip2_qformer_oacir_adafocal_vector import Blip2QformerOacirAdaFocalVector
 from lavis.models.blip2_models.blip2_qformer_oacir_latent import Blip2QformerOacirLatent
+from lavis.models.blip2_models.blip2_qformer_oacir_box_context import Blip2QformerOacirBoxContext
+from lavis.models.blip2_models.blip2_qformer_oacir_box_query import Blip2QformerOacirBoxQuery
+from lavis.models.blip2_models.blip2_qformer_oacir_box_query_identity import Blip2QformerOacirBoxQueryIdentity
 from lavis.models.blip2_models.blip2_t5_instruct import Blip2T5Instruct
 from lavis.models.blip2_models.blip2_vicuna_instruct import Blip2VicunaInstruct
 
@@ -94,6 +97,9 @@ __all__ = [
     "Blip2QformerOacirAdaFocal",
     "Blip2QformerOacirAdaFocalVector",
     "Blip2QformerOacirLatent",
+    "Blip2QformerOacirBoxContext",
+    "Blip2QformerOacirBoxQuery",
+    "Blip2QformerOacirBoxQueryIdentity",
     "Blip2T5Instruct",
     "Blip2VicunaInstruct",
 

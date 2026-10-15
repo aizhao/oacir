@@ -641,18 +641,24 @@ class Blip2QformerOacirLatent(Blip2Base):
         collected = {key: [] for key in collected_keys}
         heatmaps = []
         query_chunk_size = max(int(self.core_matcher_query_chunk_size), 1)
+        identity_reference_regions = core_reference.get(
+            "identity_region_tokens",
+            core_reference["region_tokens"],
+        )
 
         for start in range(0, num_queries, query_chunk_size):
             end = min(start + query_chunk_size, num_queries)
             if target_tokens is not None:
                 current_indices = candidate_indices[start:end]
                 reference_regions = core_reference["region_tokens"][start:end]
+                identity_regions = identity_reference_regions[start:end]
                 composed_features = core_reference["composed_feature"][start:end]
                 region_sizes = core_reference["region_sizes"][start:end]
 
                 if self.training and torch.is_grad_enabled():
                     def checkpointed_matching(
                         current_reference_regions,
+                        current_identity_regions,
                         all_target_tokens,
                         current_composed_features,
                         current_region_sizes,
@@ -664,6 +670,7 @@ class Blip2QformerOacirLatent(Blip2Base):
                             candidate_tokens,
                             current_composed_features,
                             current_region_sizes,
+                            identity_reference_region_tokens=current_identity_regions,
                             spatial_kernel_size=self.region_spatial_kernel,
                             spatial_weight=self.region_spatial_weight,
                             region_temperature=self.region_temperature,
@@ -676,6 +683,7 @@ class Blip2QformerOacirLatent(Blip2Base):
                     checkpoint_outputs = checkpoint(
                         checkpointed_matching,
                         reference_regions,
+                        identity_regions,
                         target_tokens,
                         composed_features,
                         region_sizes,
@@ -691,6 +699,7 @@ class Blip2QformerOacirLatent(Blip2Base):
                         candidate_tokens,
                         composed_features,
                         region_sizes,
+                        identity_reference_region_tokens=identity_regions,
                         spatial_kernel_size=self.region_spatial_kernel,
                         spatial_weight=self.region_spatial_weight,
                         region_temperature=self.region_temperature,
@@ -718,6 +727,7 @@ class Blip2QformerOacirLatent(Blip2Base):
                     candidate_tokens,
                     core_reference["composed_feature"][start:end],
                     core_reference["region_sizes"][start:end],
+                    identity_reference_region_tokens=identity_reference_regions[start:end],
                     spatial_kernel_size=self.region_spatial_kernel,
                     spatial_weight=self.region_spatial_weight,
                     region_temperature=self.region_temperature,
