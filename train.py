@@ -205,11 +205,19 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
     )
 
     ### Validation Datasets
-    val_variants = (
-        ['Fashion', 'Car', 'Product', 'Landmark']
-        if train_variant == 'Union'
-        else [train_variant]
-    )
+    requested_val_variants = kwargs.get("validation_domains")
+    if train_variant == "Union":
+        val_variants = requested_val_variants or [
+            "Fashion", "Car", "Product", "Landmark"
+        ]
+    else:
+        if requested_val_variants and requested_val_variants != [train_variant]:
+            raise ValueError(
+                "--validation-domains can differ from --dataset only when "
+                "training with --dataset Union"
+            )
+        val_variants = [train_variant]
+    print(f"Validation domains: {', '.join(val_variants)}")
     val_datasets = {}
     validation_log_frame = {}
 
@@ -781,6 +789,16 @@ if __name__ == '__main__':
     parser.add_argument("--bounding-box-crop", action='store_true', help="Crop bounding box region")
 
     parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epoch")
+    parser.add_argument(
+        "--validation-domains",
+        nargs="+",
+        choices=["Fashion", "Car", "Product", "Landmark"],
+        default=None,
+        help=(
+            "Validation subsets used during Union training. "
+            "Defaults to Fashion Car Product Landmark."
+        ),
+    )
     parser.add_argument("--save-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save-training", action='store_true', help="Whether save the fine-tuning model")
     parser.add_argument("--save-best", action='store_true', help="Save only the best model during fine-tuning")
@@ -887,6 +905,7 @@ if __name__ == '__main__':
         "bounding_box_color": args.bounding_box_color,
         "bounding_box_crop": args.bounding_box_crop,
         "validation_frequency": args.validation_frequency,
+        "validation_domains": args.validation_domains,
         "save_dir": args.save_dir,
         "save_training": args.save_training,
         "save_best": args.save_best,
