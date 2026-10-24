@@ -85,8 +85,26 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
         f"Loading BLIP model: name={blip_model_name}, type={vit_backbone}, device={device}...",
         flush=True,
     )
+    if blip_model_name in {
+        "oacir_latent_identity_split", "oacir_latent_margin_split"
+    }:
+        # Import the independent module before registry lookup; no changes to
+        # lavis/models/__init__.py or existing model registrations are needed.
+        from importlib import import_module
+        import_module(
+            "lavis.models.blip2_models.blip2_qformer_" + blip_model_name
+        )
     blip_model, _, txt_processors = load_model_and_preprocess(name=blip_model_name, model_type=vit_backbone, is_eval=False, device=device)
     print("BLIP model loaded.", flush=True)
+    if blip_model_name == "oacir_latent_margin_split":
+        print(
+            "Identity objective: single-positive CE + "
+            f"{blip_model.identity_margin_weight} * softplus("
+            "hardest_negative_logit - positive_logit + "
+            f"{blip_model.identity_loss_margin}); "
+            "target masks: text-free M_id and visual-text M_comp",
+            flush=True,
+        )
     if hasattr(blip_model, "set_latent_config"):
         blip_model.set_latent_config(
             core_matcher_temp=kwargs.get("core_matcher_temp", 0.07),
@@ -199,6 +217,32 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             bounding_box_crop=kwargs.get("bounding_box_crop", False),
         )
 
+    name_to_identity_id = None
+    if getattr(blip_model, "requires_identity_labels", False):
+        from lavis.models.blip2_models.blip2_qformer_oacir_latent_identity_split import (
+            identity_key_from_path,
+        )
+        identity_to_id = {}
+        name_to_identity_id = {}
+        for name, relative_path in relative_train_dataset.name_to_relpath.items():
+            identity_key = identity_key_from_path(relative_path)
+            identity_id = identity_to_id.setdefault(identity_key, len(identity_to_id))
+            name_to_identity_id[name] = identity_id
+        missing_targets = {
+            item["target"] for item in relative_train_dataset.quadruples
+        } - set(name_to_identity_id)
+        if missing_targets:
+            raise ValueError(
+                "Training targets have no annotated identity: "
+                f"{sorted(missing_targets)[:10]}"
+            )
+        print(
+            "Identity supervision: real annotated identity directories; "
+            f"{len(identity_to_id)} identities, {len(name_to_identity_id)} images; "
+            "same identity = positive, different identity = negative",
+            flush=True,
+        )
+
     relative_train_loader = DataLoader(
         dataset=relative_train_dataset, batch_size=batch_size, num_workers=kwargs['num_workers'],
         pin_memory=False, collate_fn=custom_collate_fn, drop_last=True, shuffle=True
@@ -258,6 +302,14 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
             reference_bboxes = batch_data[5]
             images_in_batch = reference_images.size(0)
 
+            identity_samples = {}
+            if name_to_identity_id is not None:
+                identity_samples["target_identity_ids"] = torch.tensor(
+                    [name_to_identity_id[name] for name in batch_data[3]],
+                    dtype=torch.long,
+                    device=reference_images.device,
+                )
+
             optimizer.zero_grad(set_to_none=True)
             blip_model.train()
 
@@ -266,6 +318,7 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
                     loss_dict = blip_model({
                         "reference_image_embeds_raw": reference_images,
                         "target_image_embeds_raw": target_images,
+                        **identity_samples,
                         "modification_text": modification_texts,
                         "reference_bbox": reference_bboxes if needs_reference_bbox else None,
                     })
@@ -273,9 +326,17 @@ def finetune_oacirr(train_variant: str, num_epochs: int, blip_model_name: str, b
                     loss_dict = blip_model({
                         "reference_image": reference_images,
                         "target_image": target_images,
+                        **identity_samples,
                         "modification_text": modification_texts,
                         "reference_bbox": reference_bboxes if needs_reference_bbox else None,
                     })
+
+                if idx == 0 and name_to_identity_id is not None:
+                    print(
+                        "Identity batch diagnostics: "
+                        + json.dumps(blip_model.identity_training_stats),
+                        flush=True,
+                    )
 
                 loss = 0.
                 for key in loss_dict.keys():
